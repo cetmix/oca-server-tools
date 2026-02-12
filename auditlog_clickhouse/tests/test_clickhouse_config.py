@@ -1,4 +1,3 @@
-from odoo.exceptions import UserError
 from odoo.tests import tagged
 from odoo.tools import mute_logger
 
@@ -47,11 +46,22 @@ class TestAuditlogClickhouseConfig(AuditLogClickhouseCommon):
         self.assertTrue(action)
         self.assertTrue(any("SELECT 1" in (q or "") for (q, params) in dummy.calls))
 
-    def test_04_cron_requires_active_config(self):
+    def test_04_cron_skips_without_active_config(self):
         self.env["auditlog.clickhouse.config"].search([]).write({"is_active": False})
 
-        with mute_logger("odoo.addons.auditlog_clickhouse.models.auditlog_log_buffer"):
-            with self.assertRaises(UserError):
-                self.env["auditlog.log.buffer"].sudo()._cron_flush_to_clickhouse(
-                    batch_size=10
-                )
+        buf = self.env["auditlog.log.buffer"].sudo()
+        rec = buf.create({"payload_json": "NOT A JSON", "state": buf.STATE_PENDING})
+
+        with self._patched_clickhouse_client() as dummy:
+            with mute_logger(
+                "odoo.addons.auditlog_clickhouse.models.auditlog_log_buffer"
+            ):
+                res = buf._cron_flush_to_clickhouse(batch_size=10)
+
+        self.assertTrue(res)
+
+        rec.invalidate_recordset()
+        self.assertEqual(rec.state, buf.STATE_PENDING)
+        self.assertFalse(rec.error_message)
+
+        self.assertFalse(dummy.calls)

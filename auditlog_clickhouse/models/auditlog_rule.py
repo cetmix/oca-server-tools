@@ -122,6 +122,17 @@ class AuditlogRule(models.Model):
           - DEBUG: timings + counts of generated buffer rows/lines.
           - WARNING/EXCEPTION: failures creating buffer payload rows.
         """
+        config = self.env["auditlog.clickhouse.config"].sudo().get_active_config()
+        if not config:
+            return super().create_logs(
+                uid,
+                res_model,
+                res_ids,
+                method,
+                old_values=old_values,
+                new_values=new_values,
+                additional_log_values=additional_log_values,
+            )
         started = time.monotonic()
 
         old_values = old_values or EMPTY_DICT

@@ -7,7 +7,6 @@ from typing import Any
 from dateutil import parser as dt_parser
 
 from odoo import api, fields, models
-from odoo.exceptions import UserError
 
 _logger = logging.getLogger(__name__)
 
@@ -166,7 +165,7 @@ class AuditlogLogBuffer(models.Model):
         config = self.env["auditlog.clickhouse.config"].sudo().get_active_config()
         if not config:
             _logger.warning("auditlog_clickhouse: flush skipped (no active config)")
-            raise UserError(self.env._("No active ClickHouse configuration found."))
+            return True
 
         pending_buffers = self.sudo().search(
             [("state", "=", self.STATE_PENDING)],
