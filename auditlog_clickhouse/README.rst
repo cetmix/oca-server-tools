@@ -28,7 +28,7 @@ Audit Log ClickHouse store and read
 
 |badge1| |badge2| |badge3| |badge4| |badge5|
 
-This module implements a buffered asynchronous transfers audit logs from
+This module implements buffered asynchronous transfers audit logs from
 PostgreSQL to ClickHouse. Storing audit data in a columnar database that
 is write-only prevents database bloat, makes audit records effectively
 immutable, and allows for scaling to very large volumes of logs without

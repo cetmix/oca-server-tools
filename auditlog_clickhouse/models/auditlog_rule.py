@@ -73,32 +73,39 @@ class AuditlogRule(models.Model):
         Cache is naturally reset on registry reload
         (auditlog invalidates registry on rule changes).
         """
-        cache: dict[int, tuple[set[str], bool]] = getattr(
+        cache: dict[tuple[int, tuple[int, ...]], tuple[set[str], bool]] = getattr(
             self.pool, "_auditlog_clickhouse_rule_cache", {}
         )
         if not hasattr(self.pool, "_auditlog_clickhouse_rule_cache"):
             self.pool._auditlog_clickhouse_rule_cache = cache
 
-        if model_id in cache:
-            return cache[model_id]
+        rules = self.filtered(lambda r: r.model_id.id == model_id)
+        if not rules:
+            domain = [("model_id", "=", model_id)]
+            if "state" in self._fields:
+                domain.append(("state", "=", "subscribed"))
+            rules = self.sudo().search(domain)
 
-        rule = self.sudo().search([("model_id", "=", model_id)], limit=1)
-        excluded = set(
-            (rule.fields_to_exclude_ids.mapped("name") if rule else [])
-            + FIELDS_BLACKLIST
-        )
-        capture_record = bool(rule and rule.capture_record)
+        key = (model_id, tuple(sorted(rules.ids)))
+        if key in cache:
+            return cache[key]
 
-        cache[model_id] = (excluded, capture_record)
+        excluded: set[str] = set(FIELDS_BLACKLIST)
+        capture_record = False
 
-        _logger.debug(
-            "auditlog_clickhouse: cached rule settings "
-            "for model_id=%s (excluded=%s capture_record=%s)",
-            model_id,
-            len(excluded),
-            capture_record,
-        )
-        return cache[model_id]
+        if len(rules) > 1:
+            _logger.warning(
+                "auditlog_clickhouse: multiple rules found for model_id=%s (rules=%s); "
+                "using union of excluded fields and any(capture_record).",
+                model_id,
+                rules.ids,
+            )
+        for rule in rules:
+            excluded |= set(rule.fields_to_exclude_ids.mapped("name"))
+            capture_record = capture_record or bool(rule.capture_record)
+
+        cache[key] = (excluded, capture_record)
+        return cache[key]
 
     # flake8: noqa: C901
     def create_logs(

@@ -7,6 +7,7 @@ from typing import Any
 from dateutil import parser as dt_parser
 
 from odoo import api, fields, models
+from odoo.tools import SQL
 
 _logger = logging.getLogger(__name__)
 
@@ -96,7 +97,7 @@ class AuditlogLogBuffer(models.Model):
         - list/dict/tuple -> JSON string (unicode preserved)
         - other -> str(value)
         """
-        if value in (None, False):
+        if value is None or value is False:
             return None
         if isinstance(value, str):
             return value
@@ -145,13 +146,38 @@ class AuditlogLogBuffer(models.Model):
             )
 
     @api.model
+    def _lock_pending_buffers(self, batch_size: int) -> "AuditlogLogBuffer":
+        """
+        Fetch up to `batch_size` pending buffers and lock them (FOR UPDATE SKIP LOCKED).
+
+        This prevents concurrent cron executions from selecting the same rows and
+        inserting duplicates into ClickHouse.
+        """
+        query = SQL(
+            """
+            SELECT id
+            FROM %s
+            WHERE state = %s
+            ORDER BY id
+                FOR UPDATE SKIP LOCKED
+                 LIMIT %s
+            """,
+            SQL.identifier(self._table),
+            self.STATE_PENDING,
+            batch_size,
+        )
+        self.env.cr.execute(query)
+        ids = [row[0] for row in self.env.cr.fetchall()]
+        return self.browse(ids)
+
+    @api.model
     def _cron_flush_to_clickhouse(self, batch_size: int = 1000) -> bool:
         """
         Flush pending buffer rows to ClickHouse.
 
         Steps:
           1) Fetch active ClickHouse configuration.
-          2) Read up to `batch_size` pending buffer rows (oldest first).
+          2) Atomically lock up to `batch_size` pending rows (SKIP LOCKED).
           3) Deserialize JSON payloads; invalid payloads -> error.
           4) Convert payloads to tuples in CH schema order.
           5) INSERT into ClickHouse in batches.
@@ -167,11 +193,7 @@ class AuditlogLogBuffer(models.Model):
             _logger.warning("auditlog_clickhouse: flush skipped (no active config)")
             return True
 
-        pending_buffers = self.sudo().search(
-            [("state", "=", self.STATE_PENDING)],
-            order="id asc",
-            limit=batch_size,
-        )
+        pending_buffers = self.sudo()._lock_pending_buffers(batch_size)
         if not pending_buffers:
             _logger.debug(
                 "auditlog_clickhouse: flush skipped (no pending buffers) (config=%s)",
@@ -230,15 +252,16 @@ class AuditlogLogBuffer(models.Model):
 
         # Insert (logs first, then lines) to reduce chance of "orphan lines"
         try:
+            db = f"`{config.database.replace('`', '``')}`"
             # ruff: noqa: E501
             if log_rows:
                 client.execute(
-                    f"INSERT INTO {config.database}.auditlog_log ({', '.join(self._CH_LOG_COLUMNS)}) VALUES",
+                    f"INSERT INTO {db}.auditlog_log ({', '.join(self._CH_LOG_COLUMNS)}) VALUES",
                     log_rows,
                 )
             if line_rows:
                 client.execute(
-                    f"INSERT INTO {config.database}.auditlog_log_line ({', '.join(self._CH_LINE_COLUMNS)}) VALUES",
+                    f"INSERT INTO {db}.auditlog_log_line ({', '.join(self._CH_LINE_COLUMNS)}) VALUES",
                     line_rows,
                 )
         except Exception as exc:
