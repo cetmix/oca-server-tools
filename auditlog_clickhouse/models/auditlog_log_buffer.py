@@ -79,8 +79,8 @@ class AuditlogLogBuffer(models.Model):
 
     payload_json = fields.Text(required=True)
     state = fields.Selection(
-        selection=_selection_state,
-        default=STATE_PENDING,
+        selection=lambda self: self._selection_state(),
+        default=lambda self: self.STATE_PENDING,
         required=True,
         index=True,
     )
