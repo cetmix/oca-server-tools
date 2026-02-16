@@ -24,6 +24,7 @@ class AuditlogClickhouseConfig(models.Model):
 
     _name = "auditlog.clickhouse.config"
     _description = "Auditlog ClickHouse Configuration"
+    _rec_name = "database"
 
     DEFAULT_PORT = 9000
     DEFAULT_DB = "odoo_audit"
@@ -69,6 +70,15 @@ class AuditlogClickhouseConfig(models.Model):
         help="Password for the ClickHouse user.",
     )
 
+    @api.depends("host", "port", "database", "user", "is_active")
+    def _compute_display_name(self):
+        for rec in self:
+            base = (
+                f"{rec.host or ''}:{rec.port or ''}/"
+                f"{rec.database or ''} ({rec.user or ''})"
+            )
+            rec.display_name = f"{base} [active]" if rec.is_active else base
+
     @api.model
     def get_active_config(self) -> Optional["AuditlogClickhouseConfig"]:
         """Return the currently active configuration (if any)."""
@@ -96,6 +106,34 @@ class AuditlogClickhouseConfig(models.Model):
                 self.ids,
             )
             other_configs.write({"is_active": False})
+
+    @api.onchange("is_active")
+    def _onchange_is_active(self):
+        """
+        Warn user that only one config can be active;
+        others will be deactivated on save.
+        """
+        for rec in self:
+            if not rec.is_active:
+                continue
+
+            domain = [("is_active", "=", True)]
+            if rec.id:
+                domain.append(("id", "!=", rec.id))
+
+            other = rec.env["auditlog.clickhouse.config"].sudo().search(domain, limit=1)
+            if other:
+                return {
+                    "warning": {
+                        "title": rec.env._("Only one active connection"),
+                        "message": rec.env._(
+                            "Only one ClickHouse connection can be active at a time\n\n"
+                            "If you save this configuration as active, "
+                            "the currently active one will be deactivated:\n- %s"
+                        )
+                        % (other.display_name,),
+                    }
+                }
 
     @api.model_create_multi
     def create(self, vals_list: list[dict[str, Any]]):
@@ -191,10 +229,11 @@ class AuditlogClickhouseConfig(models.Model):
 
     def action_create_auditlog_tables(self) -> dict[str, Any]:
         """
-        UI button: create ClickHouse database/tables if they do not exist.
+        UI button: create ClickHouse tables if they do not exist.
 
         Important:
           - This is optional. In production you may point to an existing DB.
+          - Database must already exist.
           - We intentionally do not create users/grants in this project.
         """
         self.ensure_one()
@@ -272,7 +311,6 @@ class AuditlogClickhouseConfig(models.Model):
         db_name = self.database
 
         return [
-            f"CREATE DATABASE IF NOT EXISTS {db_name}",
             f"""
             CREATE TABLE IF NOT EXISTS {db_name}.auditlog_log
             (

@@ -171,7 +171,12 @@ class AuditlogLogBuffer(models.Model):
         return self.browse(ids)
 
     @api.model
-    def _cron_flush_to_clickhouse(self, batch_size: int = 1000) -> bool:
+    def _cron_flush_to_clickhouse(
+        self,
+        batch_size: int = 1000,
+        max_batches: int = 50,
+        max_seconds: float = 25.0,
+    ) -> bool:
         """
         Flush pending buffer rows to ClickHouse.
 
@@ -193,101 +198,100 @@ class AuditlogLogBuffer(models.Model):
             _logger.warning("auditlog_clickhouse: flush skipped (no active config)")
             return True
 
-        pending_buffers = self.sudo()._lock_pending_buffers(batch_size)
-        if not pending_buffers:
-            _logger.debug(
-                "auditlog_clickhouse: flush skipped (no pending buffers) (config=%s)",
-                config.id,
-            )
-            return True
-
-        _logger.info(
-            "auditlog_clickhouse: flush started (config=%s host=%s:%s db=%s batch_size=%s pending=%s)",
-            config.id,
-            config.host,
-            config.port,
-            config.database,
-            batch_size,
-            len(pending_buffers),
-        )
-
         client = config._get_client()
 
-        log_rows: list[ChRow] = []
-        line_rows: list[ChRow] = []
-        invalid_buffers = self.browse()
+        total_flushed = 0
+        total_invalid = 0
+        total_inserted_logs = 0
+        total_inserted_lines = 0
+        batches = 0
 
-        for buffer_rec in pending_buffers:
-            try:
-                payload: JsonMapping = json.loads(buffer_rec.payload_json)
-            except Exception as exc:
-                buffer_rec._set_error(self.env._("Invalid JSON payload: %s") % exc)
-                invalid_buffers |= buffer_rec
+        while True:
+            if batches >= max_batches or (time.monotonic() - started) >= max_seconds:
+                break
+
+            pending_buffers = self.sudo()._lock_pending_buffers(batch_size)
+            if not pending_buffers:
+                break
+
+            batches += 1
+
+            log_rows: list[ChRow] = []
+            line_rows: list[ChRow] = []
+            invalid_buffers = self.browse()
+
+            for buffer_rec in pending_buffers:
+                try:
+                    payload: JsonMapping = json.loads(buffer_rec.payload_json)
+                except Exception as exc:
+                    buffer_rec._set_error(self.env._("Invalid JSON payload: %s") % exc)
+                    invalid_buffers |= buffer_rec
+                    continue
+
+                log_data = payload.get("log") or {}
+                lines_data = payload.get("lines") or []
+
+                if log_data:
+                    log_rows.append(self._build_ch_log_row(log_data))
+                for line_data in lines_data:
+                    line_rows.append(self._build_ch_line_row(line_data))
+
+            valid_buffers = pending_buffers - invalid_buffers
+            if invalid_buffers:
+                total_invalid += len(invalid_buffers)
+                _logger.warning(
+                    "auditlog_clickhouse: invalid JSON payloads=%s "
+                    "(marked error) (config=%s)",
+                    len(invalid_buffers),
+                    config.id,
+                )
+
+            if not valid_buffers:
                 continue
 
-            log_data = payload.get("log") or {}
-            lines_data = payload.get("lines") or []
-
-            if log_data:
-                log_rows.append(self._build_ch_log_row(log_data))
-
-            for line_data in lines_data:
-                line_rows.append(self._build_ch_line_row(line_data))
-
-        valid_buffers = pending_buffers - invalid_buffers
-        if invalid_buffers:
-            _logger.warning(
-                "auditlog_clickhouse: invalid JSON payloads=%s (marked error)",
-                len(invalid_buffers),
-            )
-
-        if not valid_buffers:
-            _logger.info(
-                "auditlog_clickhouse: flush finished "
-                "(nothing valid to insert) (invalid=%s) in %.3fs",
-                len(invalid_buffers),
-                time.monotonic() - started,
-            )
-            return True
-
-        # Insert (logs first, then lines) to reduce chance of "orphan lines"
-        try:
-            db = f"`{config.database.replace('`', '``')}`"
-            # ruff: noqa: E501
-            if log_rows:
-                client.execute(
-                    f"INSERT INTO {db}.auditlog_log ({', '.join(self._CH_LOG_COLUMNS)}) VALUES",
-                    log_rows,
+            try:
+                if log_rows:
+                    client.execute(
+                        f"INSERT INTO {config.database}.auditlog_log ("
+                        f"{', '.join(self._CH_LOG_COLUMNS)}) VALUES",
+                        log_rows,
+                    )
+                if line_rows:
+                    client.execute(
+                        f"INSERT INTO {config.database}.auditlog_log_line ("
+                        f"{', '.join(self._CH_LINE_COLUMNS)}) VALUES",
+                        line_rows,
+                    )
+            except Exception as exc:
+                error_msg = self.env._("ClickHouse insert failed: %s") % exc
+                _logger.exception(
+                    "auditlog_clickhouse: INSERT failed "
+                    "(config=%s valid_buffers=%s log_rows=%s line_rows=%s)",
+                    config.id,
+                    len(valid_buffers),
+                    len(log_rows),
+                    len(line_rows),
                 )
-            if line_rows:
-                client.execute(
-                    f"INSERT INTO {db}.auditlog_log_line ({', '.join(self._CH_LINE_COLUMNS)}) VALUES",
-                    line_rows,
-                )
-        except Exception as exc:
-            error_msg = self.env._("ClickHouse insert failed: %s") % exc
-            _logger.exception(
-                "auditlog_clickhouse: INSERT failed "
-                "(config=%s valid_buffers=%s log_rows=%s line_rows=%s)",
-                config.id,
-                len(valid_buffers),
-                len(log_rows),
-                len(line_rows),
-            )
-            valid_buffers._set_error(error_msg)
-            return True
+                valid_buffers._set_error(error_msg)
+                return True
 
-        flushed_count = len(valid_buffers)
-        valid_buffers.unlink()
+            flushed_count = len(valid_buffers)
+            valid_buffers.unlink()
+
+            total_flushed += flushed_count
+            total_inserted_logs += len(log_rows)
+            total_inserted_lines += len(line_rows)
 
         _logger.info(
-            "auditlog_clickhouse: flush OK (config=%s flushed_buffers=%s "
+            "auditlog_clickhouse: flush finished "
+            "(config=%s batches=%s flushed_buffers=%s "
             "inserted_logs=%s inserted_lines=%s invalid=%s) in %.3fs",
             config.id,
-            flushed_count,
-            len(log_rows),
-            len(line_rows),
-            len(invalid_buffers),
+            batches,
+            total_flushed,
+            total_inserted_logs,
+            total_inserted_lines,
+            total_invalid,
             time.monotonic() - started,
         )
         return True

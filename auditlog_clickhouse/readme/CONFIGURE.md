@@ -1,3 +1,16 @@
+This module requires:
+
+- A reachable ClickHouse server.
+- Python dependency `clickhouse-driver` available in the Odoo environment.
+- A ClickHouse database created in advance (the module does **not** create databases/users/grants).
+- A ClickHouse user with at least:
+  - `INSERT` and `CREATE TABLE` privileges on the target database.
+
+> ClickHouse installation (Docker guide):
+> `https://clickhouse.com/docs/install/docker`
+
+Steps:
+
 - Make sure `clickhouse-driver` is available in your system.
 - Install the module.
 - Configure the connection parameters in Odoo:

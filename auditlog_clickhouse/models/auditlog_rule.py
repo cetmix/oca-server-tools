@@ -107,7 +107,293 @@ class AuditlogRule(models.Model):
         cache[key] = (excluded, capture_record)
         return cache[key]
 
-    # flake8: noqa: C901
+    def _get_audit_model_id(self, res_model: str) -> int:
+        """
+        Resolve `ir.model` id for a given model name.
+
+        Prefer auditlog's in-memory model cache (filled by auditlog hooks) to avoid
+        extra DB lookups. If cache is missing, fall back to `ir.model._get()`.
+
+        Args:
+            res_model: Technical model name (e.g. "res.partner").
+
+        Returns:
+            The `ir.model` record id for the given model name.
+        """
+        model_id = self.pool._auditlog_model_cache.get(res_model)
+        if model_id:
+            return int(model_id)
+        return int(self.env["ir.model"].sudo()._get(res_model).id)
+
+    def _build_base_log(
+        self,
+        *,
+        uid: int,
+        method: str,
+        model_id: int,
+        log_type: Any,
+        now_iso: str,
+    ) -> _PayloadLog:
+        """
+        Build base (common) payload for the `log` part of ClickHouse audit entries.
+
+        The returned dict is later merged into per-record log data, and contains
+        denormalized model metadata and common fields.
+
+        Args:
+            uid: Acting user id.
+            method: Audited operation (create, read, write, unlink, export_data).
+            model_id: `ir.model` id for the audited model.
+            log_type: Auditlog rule log type (e.g. "full" / "fast") or None.
+            now_iso: UTC ISO timestamp string used for `create_date`.
+
+        Returns:
+            A dict compatible with `_PayloadLog`.
+        """
+        model_rec = self.env["ir.model"].sudo().browse(model_id)
+        return {
+            "model_id": int(model_id),
+            "model_name": model_rec.name,
+            "model_model": model_rec.model,
+            "user_id": int(uid),
+            "method": method,
+            "http_request_id": None,
+            "http_session_id": None,
+            "log_type": log_type,
+            "create_date": now_iso,
+            "create_uid": int(uid),
+        }
+
+    def _build_export_payload(
+        self,
+        *,
+        res_model: str,
+        res_ids: Sequence[int],
+        base_log: _PayloadLog,
+    ) -> dict[str, Any]:
+        """
+        Build a payload for the `export_data` audit method.
+
+        Args:
+            res_model: Technical model name.
+            res_ids: Record ids being exported.
+            base_log: Common log payload built by `_build_base_log()`.
+
+        Returns:
+            Full payload dict to be JSON-serialized and written into buffer.
+        """
+        return {
+            "log": {
+                "id": str(uuid.uuid4()),
+                "name": res_model,
+                "res_id": None,
+                "res_ids": str(list(res_ids)),
+                **base_log,
+            },
+            "lines": [],
+        }
+
+    def _select_line_builder(
+        self,
+        *,
+        method: str,
+        capture_record: bool,
+        old_values: Mapping[int, Mapping[str, Any]],
+        new_values: Mapping[int, Mapping[str, Any]],
+    ) -> tuple[
+        Callable[..., dict[str, Any]] | None,
+        tuple[Mapping[int, Mapping[str, Any]], ...],
+        bool,
+    ]:
+        """
+        Select auditlog line builder and value sources for the given method.
+
+        Args:
+            method: Audited operation ("create", "read", "write", "unlink", ...).
+            capture_record: Rule flag that enables capturing record values on unlink
+            old_values: Mapping `{res_id: {field: value}}` captured before the operation
+            new_values: Mapping `{res_id: {field: value}}` captured after the operation
+
+        Returns:
+            A tuple of:
+              - line_builder: Callable used to build a single log line values dict,
+                or None if lines should not be produced for this method.
+              - values_src: Tuple containing old/new mappings passed to `line_builder`.
+              - include_lines_on_unlink: Whether unlink should produce lines.
+        """
+        include_lines_on_unlink = method == "unlink" and capture_record
+
+        if method == "create":
+            return (
+                self._prepare_log_line_vals_on_create,
+                (new_values,),
+                include_lines_on_unlink,
+            )
+        if method == "read":
+            return (
+                self._prepare_log_line_vals_on_read,
+                (old_values,),
+                include_lines_on_unlink,
+            )
+        if method == "write":
+            return (
+                self._prepare_log_line_vals_on_write,
+                (old_values, new_values),
+                include_lines_on_unlink,
+            )
+        if include_lines_on_unlink:
+            return (
+                self._prepare_log_line_vals_on_read,
+                (old_values,),
+                include_lines_on_unlink,
+            )
+
+        return None, (), include_lines_on_unlink
+
+    def _fields_list_for_record(
+        self,
+        *,
+        method: str,
+        include_lines_on_unlink: bool,
+        res_id: int,
+        old_values: Mapping[int, Mapping[str, Any]],
+        new_values: Mapping[int, Mapping[str, Any]],
+    ) -> Iterable[str]:
+        """
+        Determine which field names should be turned into audit lines for a record.
+
+        Args:
+            method: Audited operation.
+            include_lines_on_unlink: True when unlink lines are enabled by the rule.
+            res_id: Record id being processed.
+            old_values: Mapping `{res_id: {field: value}}` captured before operation.
+            new_values: Mapping `{res_id: {field: value}}` captured after operation.
+
+        Returns:
+            Iterable of field technical names to process into payload lines.
+        """
+        diff = DictDiffer(
+            dict(new_values.get(res_id, EMPTY_DICT)),
+            dict(old_values.get(res_id, EMPTY_DICT)),
+        )
+
+        if method == "create":
+            return diff.added()
+        if method == "read" or include_lines_on_unlink:
+            return old_values.get(res_id, EMPTY_DICT).keys()
+        if method == "write":
+            return diff.changed()
+        return ()
+
+    def _build_lines_for_record(
+        self,
+        *,
+        uid: int,
+        now_iso: str,
+        model_id: int,
+        log_id: str,
+        log_ctx: dict[str, Any],
+        method: str,
+        include_lines_on_unlink: bool,
+        line_builder: Callable[..., dict[str, Any]] | None,
+        values_src: tuple[Mapping[int, Mapping[str, Any]], ...],
+        fields_list: Iterable[str],
+        fields_to_exclude_set: set[str],
+    ) -> list[_PayloadLine]:
+        """
+        Build payload line entries for a single audited record.
+
+        Args:
+            uid: Acting user id.
+            now_iso: UTC ISO timestamp string used for line `create_date`.
+            model_id: `ir.model` id for the audited model.
+            log_id: UUID of the parent log entry.
+            log_ctx: Context dict passed to auditlog helper.
+            method: Audited operation.
+            include_lines_on_unlink: Whether unlink should be treated as read for lines.
+            line_builder: Selected builder callable, or None to return no lines.
+            values_src: Tuple of source mappings passed into `line_builder`.
+            fields_list: Field names selected by `_fields_list_for_record()`.
+            fields_to_exclude_set: Set of field names to ignore.
+
+        Returns:
+            List of `_PayloadLine` dicts.
+        """
+        if not line_builder:
+            return []
+
+        one_source = method in ("create", "read") or include_lines_on_unlink
+        lines: list[_PayloadLine] = []
+
+        for field_name in fields_list:
+            if field_name in fields_to_exclude_set:
+                continue
+
+            field = self._get_field(model_id, field_name)
+            if not field:
+                continue  # Dummy / non-loggable field
+
+            if one_source:
+                vals = line_builder(log_ctx, field, values_src[0])
+            else:
+                vals = line_builder(log_ctx, field, values_src[0], values_src[1])
+
+            lines.append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "log_id": log_id,
+                    "field_id": int(field["id"]),
+                    "field_name": field.get("name"),
+                    "field_description": field.get("field_description"),
+                    "old_value": vals.get("old_value"),
+                    "new_value": vals.get("new_value"),
+                    "old_value_text": vals.get("old_value_text"),
+                    "new_value_text": vals.get("new_value_text"),
+                    "create_date": now_iso,
+                    "create_uid": int(uid),
+                }
+            )
+
+        return lines
+
+    def _dump_payload_json(self, payload: dict[str, Any]) -> str:
+        """
+        Serialize a payload dict to JSON for storing in the PostgreSQL buffer.
+
+        Args:
+            payload: Payload dict with structure {"log": ..., "lines": ...}.
+
+        Returns:
+            JSON string ready to be written into `auditlog.log.buffer.payload_json`.
+        """
+        return json.dumps(payload, ensure_ascii=False, default=_json_default)
+
+    def _buffer_create_or_log(
+        self,
+        *,
+        buffer_model,
+        buffer_vals_list: list[dict[str, Any]],
+        on_fail_msg: str,
+        on_fail_args: tuple[Any, ...],
+    ) -> None:
+        """
+        Create buffer rows and log a consistent exception message on failure.
+
+        Args:
+            buffer_model: Recordset of `auditlog.log.buffer` (typically sudo()).
+            buffer_vals_list: List of dicts passed to `create()`.
+            on_fail_msg: Logger message template used on exception.
+            on_fail_args: Arguments for the logger template.
+
+        Raises:
+            Any exception raised by `buffer_model.create()` is re-raised.
+        """
+        try:
+            buffer_model.create(buffer_vals_list)
+        except Exception:
+            _logger.exception(on_fail_msg, *on_fail_args)
+            raise
+
     def create_logs(
         self,
         uid: int,
@@ -118,17 +404,7 @@ class AuditlogRule(models.Model):
         new_values: Mapping[int, Mapping[str, Any]] | None = None,
         additional_log_values: Mapping[str, Any] | None = None,
     ) -> None:
-        """Write audit logs to ClickHouse buffer instead of PostgreSQL audit tables.
-
-        This overrides `auditlog.rule.create_logs()`:
-        - No rows are created in `auditlog.log` / `auditlog.log.line` (PostgreSQL).
-        - A single JSON payload is stored in `auditlog.log.buffer` per logged entry.
-        - The cron will later flush these payloads into ClickHouse.
-
-        Logging:
-          - DEBUG: timings + counts of generated buffer rows/lines.
-          - WARNING/EXCEPTION: failures creating buffer payload rows.
-        """
+        """Write audit logs to ClickHouse buffer instead of PostgreSQL audit tables."""
         config = self.env["auditlog.clickhouse.config"].sudo().get_active_config()
         if not config:
             return super().create_logs(
@@ -158,68 +434,37 @@ class AuditlogRule(models.Model):
                 log_type,
             )
 
-        # Prefer auditlog's model cache (filled by their _register_hook),
-        # fallback to ir.model lookup.
-        model_id = self.pool._auditlog_model_cache.get(res_model)
-        if not model_id:
-            model_id = self.env["ir.model"].sudo()._get(res_model).id
-
-        model_rec = self.env["ir.model"].sudo().browse(model_id)
+        model_id = self._get_audit_model_id(res_model)
         model_rs = self.env[res_model]
-
         fields_to_exclude_set, capture_record = self._get_rule_settings(model_id)
 
-        # Single timestamp for the whole batch: consistent ordering for log + lines.
         now_iso = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-
-        base_log: _PayloadLog = {
-            "model_id": int(model_id),
-            "model_name": model_rec.name,
-            "model_model": model_rec.model,
-            "user_id": int(uid),
-            "method": method,
-            # Intentionally not creating auditlog
-            # HTTP PG tables in the write-only module.
-            "http_request_id": None,
-            "http_session_id": None,
-            "log_type": log_type,
-            "create_date": now_iso,
-            "create_uid": int(uid),
-        }
+        base_log = self._build_base_log(
+            uid=uid,
+            method=method,
+            model_id=model_id,
+            log_type=log_type,
+            now_iso=now_iso,
+        )
 
         buffer_model = self.env["auditlog.log.buffer"].sudo()
         buffer_vals_list: list[dict[str, Any]] = []
 
-        # Fast-path: export_data produces one entry, no lines.
         if method == "export_data":
-            payload: _Payload = {
-                "log": {
-                    "id": str(uuid.uuid4()),
-                    "name": res_model,
-                    "res_id": None,
-                    "res_ids": str(list(res_ids)),
-                    **base_log,
-                },
-                "lines": [],
-            }
-            buffer_vals_list.append(
-                {
-                    "payload_json": json.dumps(
-                        payload, ensure_ascii=False, default=_json_default
-                    )
-                }
+            payload = self._build_export_payload(
+                res_model=res_model, res_ids=res_ids, base_log=base_log
             )
+            buffer_vals_list.append({"payload_json": self._dump_payload_json(payload)})
 
-            try:
-                buffer_model.create(buffer_vals_list)
-            except Exception:
-                _logger.exception(
+            self._buffer_create_or_log(
+                buffer_model=buffer_model,
+                buffer_vals_list=buffer_vals_list,
+                on_fail_msg=(
                     "auditlog_clickhouse: buffer create failed "
-                    "(export_data) (model=%s uid=%s)",
-                    res_model,
-                    uid,
-                )
-                raise
+                    "(export_data) (model=%s uid=%s)"
+                ),
+                on_fail_args=(res_model, uid),
+            )
 
             _logger.debug(
                 "auditlog_clickhouse: create_logs end "
@@ -228,27 +473,12 @@ class AuditlogRule(models.Model):
             )
             return
 
-        # Select correct line builder + field source for each method.
-        # We reuse auditlog's own _prepare_* helpers to keep semantics aligned.
-        line_builder: Callable[..., dict[str, Any]] | None
-        values_src: tuple[Mapping[int, Mapping[str, Any]], ...]
-        include_lines_on_unlink = method == "unlink" and capture_record
-
-        if method == "create":
-            line_builder = self._prepare_log_line_vals_on_create
-            values_src = (new_values,)
-        elif method == "read":
-            line_builder = self._prepare_log_line_vals_on_read
-            values_src = (old_values,)
-        elif method == "write":
-            line_builder = self._prepare_log_line_vals_on_write
-            values_src = (old_values, new_values)
-        elif include_lines_on_unlink:
-            line_builder = self._prepare_log_line_vals_on_read
-            values_src = (old_values,)
-        else:
-            line_builder = None
-            values_src = ()
+        line_builder, values_src, include_lines_on_unlink = self._select_line_builder(
+            method=method,
+            capture_record=capture_record,
+            old_values=old_values,
+            new_values=new_values,
+        )
 
         total_lines = 0
         produced_payloads = 0
@@ -265,68 +495,34 @@ class AuditlogRule(models.Model):
                 **base_log,
             }
 
-            # Determine which fields should produce lines for this record.
-            diff = DictDiffer(
-                dict(new_values.get(res_id, EMPTY_DICT)),
-                dict(old_values.get(res_id, EMPTY_DICT)),
+            fields_list = self._fields_list_for_record(
+                method=method,
+                include_lines_on_unlink=include_lines_on_unlink,
+                res_id=res_id,
+                old_values=old_values,
+                new_values=new_values,
             )
 
-            if method == "create":
-                fields_list: Iterable[str] = diff.added()
-            elif method == "read":
-                fields_list = old_values.get(res_id, EMPTY_DICT).keys()
-            elif method == "write":
-                fields_list = diff.changed()
-            elif include_lines_on_unlink:
-                fields_list = old_values.get(res_id, EMPTY_DICT).keys()
-            else:
-                fields_list = ()
-
             log_ctx = {"res_id": res_id, "model_id": model_id, "log_type": log_type}
-            lines: list[_PayloadLine] = []
+            lines = self._build_lines_for_record(
+                uid=uid,
+                now_iso=now_iso,
+                model_id=model_id,
+                log_id=log_id,
+                log_ctx=log_ctx,
+                method=method,
+                include_lines_on_unlink=include_lines_on_unlink,
+                line_builder=line_builder,
+                values_src=values_src,
+                fields_list=fields_list,
+                fields_to_exclude_set=fields_to_exclude_set,
+            )
 
-            if line_builder:
-                for field_name in fields_list:
-                    if field_name in fields_to_exclude_set:
-                        continue
-
-                    field = self._get_field(model_id, field_name)
-                    if not field:
-                        # Dummy / non-loggable field (no ir.model.fields row)
-                        continue
-
-                    # Reuse auditlog helper to keep the same old/new/text semantics.
-                    if method in ("create", "read") or include_lines_on_unlink:
-                        vals = line_builder(log_ctx, field, values_src[0])
-                    else:
-                        vals = line_builder(
-                            log_ctx, field, values_src[0], values_src[1]
-                        )
-
-                    lines.append(
-                        {
-                            "id": str(uuid.uuid4()),
-                            "log_id": log_id,
-                            "field_id": int(field["id"]),
-                            "field_name": field.get("name"),
-                            "field_description": field.get("field_description"),
-                            "old_value": vals.get("old_value"),
-                            "new_value": vals.get("new_value"),
-                            "old_value_text": vals.get("old_value_text"),
-                            "new_value_text": vals.get("new_value_text"),
-                            "create_date": now_iso,
-                            "create_uid": int(uid),
-                        }
-                    )
-
-            # Match original semantics: unlink is always logged;
-            # others only if there are lines.
             if method == "unlink" or lines:
-                payload = {"log": log, "lines": lines}
                 buffer_vals_list.append(
                     {
-                        "payload_json": json.dumps(
-                            payload, ensure_ascii=False, default=_json_default
+                        "payload_json": self._dump_payload_json(
+                            {"log": log, "lines": lines}
                         )
                     }
                 )
@@ -347,20 +543,15 @@ class AuditlogRule(models.Model):
             )
             return
 
-        try:
-            # Batch insert into PostgreSQL buffer to minimize ORM overhead.
-            buffer_model.create(buffer_vals_list)
-        except Exception:
-            _logger.exception(
+        self._buffer_create_or_log(
+            buffer_model=buffer_model,
+            buffer_vals_list=buffer_vals_list,
+            on_fail_msg=(
                 "auditlog_clickhouse: buffer create failed "
-                "(model=%s method=%s uid=%s payloads=%s lines=%s)",
-                res_model,
-                method,
-                uid,
-                produced_payloads,
-                total_lines,
-            )
-            raise
+                "(model=%s method=%s uid=%s payloads=%s lines=%s)"
+            ),
+            on_fail_args=(res_model, method, uid, produced_payloads, total_lines),
+        )
 
         _logger.debug(
             "auditlog_clickhouse: create_logs end (model=%s method=%s "

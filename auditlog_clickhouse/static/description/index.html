@@ -407,6 +407,23 @@ to audited operations.</li>
 </div>
 <div class="section" id="configuration">
 <h1><a class="toc-backref" href="#toc-entry-2">Configuration</a></h1>
+<p>This module requires:</p>
+<ul class="simple">
+<li>A reachable ClickHouse server.</li>
+<li>Python dependency <tt class="docutils literal"><span class="pre">clickhouse-driver</span></tt> available in the Odoo
+environment.</li>
+<li>A ClickHouse database created in advance (the module does <strong>not</strong>
+create databases/users/grants).</li>
+<li>A ClickHouse user with at least:<ul>
+<li><tt class="docutils literal">INSERT</tt> and <tt class="docutils literal">CREATE TABLE</tt> privileges on the target database.</li>
+</ul>
+</li>
+</ul>
+<!--  -->
+<blockquote>
+ClickHouse installation (Docker guide):
+<tt class="docutils literal"><span class="pre">https://clickhouse.com/docs/install/docker</span></tt></blockquote>
+<p>Steps:</p>
 <ul class="simple">
 <li>Make sure <tt class="docutils literal"><span class="pre">clickhouse-driver</span></tt> is available in your system.</li>
 <li>Install the module.</li>
