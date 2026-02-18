@@ -8,14 +8,15 @@
     "website": "https://github.com/OCA/server-tools",
     "depends": [
         "auditlog",
+        "queue_job",
     ],
     "external_dependencies": {
         "python": ["clickhouse_driver"],
     },
     "data": [
         "security/ir.model.access.csv",
+        "data/auditlog_clickhouse_queue.xml",
         "views/auditlog_clickhouse_config_views.xml",
-        "data/ir_cron.xml",
     ],
     "installable": True,
 }

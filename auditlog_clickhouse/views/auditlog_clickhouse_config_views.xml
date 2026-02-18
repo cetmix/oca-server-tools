@@ -1,4 +1,19 @@
 <odoo>
+    <record
+        id="action_configure_auditlog_clickhouse_flush_cron"
+        model="ir.actions.act_window"
+    >
+        <field name="name">Configure flush action</field>
+        <field name="res_model">ir.cron</field>
+        <field
+            name="res_id"
+            ref="auditlog_clickhouse.ir_cron_auditlog_clickhouse_enqueue_flush"
+        />
+        <field name="type">ir.actions.act_window</field>
+        <field name="view_mode">form</field>
+        <field name="target">new</field>
+    </record>
+
     <record id="view_auditlog_clickhouse_config_form" model="ir.ui.view">
         <field name="name">auditlog.clickhouse.config.form</field>
         <field name="model">auditlog.clickhouse.config</field>
@@ -24,6 +39,17 @@
                         <field name="is_active" />
                     </group>
 
+                    <div
+                        class="alert alert-warning mb-2"
+                        role="alert"
+                        invisible="not is_active"
+                    >
+                        As soon as this connection to ClickHouse is activated, all log
+                        entries from that moment will be stored in the configured
+                        ClickHouse database. Only one connection can be active at a
+                        time.
+                    </div>
+
                     <group string="Connection">
                         <field name="host" />
                         <field name="port" />
@@ -32,9 +58,24 @@
                         <field name="password" password="True" />
                     </group>
 
+                    <group string="Export Queue">
+                        <field name="queue_batch_size" />
+                        <field name="queue_channel_id" />
+                        <div class="mt8">
+                            <button
+                                name="%(action_configure_auditlog_clickhouse_flush_cron)d"
+                                type="action"
+                                string="Configure action"
+                                class="oe_link"
+                                icon="fa-arrow-right"
+                            />
+                        </div>
+                    </group>
+
                     <group string="Notes">
                         <div class="text-muted">
-                            Logs are buffered in PostgreSQL and periodically flushed to ClickHouse by cron.
+                            Logs are buffered in PostgreSQL and periodically flushed to
+                            ClickHouse by cron.
                         </div>
                     </group>
                 </sheet>
@@ -47,7 +88,7 @@
         <field name="model">auditlog.clickhouse.config</field>
         <field name="arch" type="xml">
             <list string="ClickHouse Configuration">
-                <field name="is_active" />
+                <field name="is_active" string="Is Active" />
                 <field name="display_name" />
                 <field name="host" />
                 <field name="port" optional="hide" />

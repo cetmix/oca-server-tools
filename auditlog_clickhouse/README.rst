@@ -83,19 +83,23 @@ Steps:
   - **Settings > Technical > Auditlog > Clickhouse configuration**
   - Fill in the following parameters:
 
-+--------------------------+
-| Field                    |
-+==========================+
-| Hostname or IP           |
-+--------------------------+
-| TCP port                 |
-+--------------------------+
-| ClickHouse database name |
-+--------------------------+
-| ClickHouse user          |
-+--------------------------+
-| ClickHouse Password      |
-+--------------------------+
++---------------------------------------+
+| Field                                 |
++=======================================+
+| Hostname or IP                        |
++---------------------------------------+
+| TCP port                              |
++---------------------------------------+
+| ClickHouse database name              |
++---------------------------------------+
+| ClickHouse user                       |
++---------------------------------------+
+| ClickHouse Password                   |
++---------------------------------------+
+| queue_job_batch_size (default = 1000) |
++---------------------------------------+
+| channel_id (default root)             |
++---------------------------------------+
 
 - Click **Test connection**.
 - Optionally, click **Create Auditlog Tables** to create the tables and

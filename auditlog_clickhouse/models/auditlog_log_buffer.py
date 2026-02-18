@@ -1,6 +1,5 @@
 import json
 import logging
-import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -8,6 +7,8 @@ from dateutil import parser as dt_parser
 
 from odoo import api, fields, models
 from odoo.tools import SQL
+
+from odoo.addons.queue_job.exception import RetryableJobError
 
 _logger = logging.getLogger(__name__)
 
@@ -19,16 +20,17 @@ class AuditlogLogBuffer(models.Model):
     """
     Buffered audit log payloads waiting to be flushed into ClickHouse.
 
-    Each record stores a pre-serialized JSON payload produced by the auditlog.rule
-    override. A periodic cron:
-      - reads pending buffer rows
-      - converts payload into ClickHouse rows (tuple order matches schema)
-      - inserts them in batches
-      - deletes successfully flushed buffer rows from PostgreSQL
+    Each record stores a pre-built payload produced by the auditlog.rule override.
+    Export is asynchronous:
 
-    Notes:
-      - No user-facing ACLs should be provided for this model by design.
-      - The cron runs with sudo and is the only expected consumer.
+      - A cron enqueues a queue_job.
+      - The queue_job locks pending buffer rows (FOR UPDATE SKIP LOCKED),
+        converts payloads to ClickHouse tuples and inserts them in batches.
+      - Successfully flushed buffer rows are removed from PostgreSQL.
+
+    Design notes:
+      - This model is an internal queue; no user-facing ACLs should be provided.
+      - queue_job provides retries/backoff when ClickHouse is slow/unavailable.
     """
 
     _name = "auditlog.log.buffer"
@@ -69,6 +71,10 @@ class AuditlogLogBuffer(models.Model):
         "create_uid",
     )
 
+    _INVALID_PAYLOAD_MESSAGE = (
+        "Invalid payload structure (expected object with 'log' and 'lines')."
+    )
+
     @api.model
     def _selection_state(self) -> list[tuple[str, str]]:
         """Centralized selection for `state`."""
@@ -77,7 +83,7 @@ class AuditlogLogBuffer(models.Model):
             (self.STATE_ERROR, self.env._("Error")),
         ]
 
-    payload_json = fields.Text(required=True)
+    payload_json = fields.Json(required=True)
     state = fields.Selection(
         selection=lambda self: self._selection_state(),
         default=lambda self: self.STATE_PENDING,
@@ -150,7 +156,7 @@ class AuditlogLogBuffer(models.Model):
         """
         Fetch up to `batch_size` pending buffers and lock them (FOR UPDATE SKIP LOCKED).
 
-        This prevents concurrent cron executions from selecting the same rows and
+        This prevents concurrent workers/jobs from selecting the same rows and
         inserting duplicates into ClickHouse.
         """
         query = SQL(
@@ -171,130 +177,253 @@ class AuditlogLogBuffer(models.Model):
         return self.browse(ids)
 
     @api.model
-    def _cron_flush_to_clickhouse(
-        self,
-        batch_size: int = 1000,
-        max_batches: int = 50,
-        max_seconds: float = 25.0,
-    ) -> bool:
+    def _cron_flush_to_clickhouse(self, batch_size: int | None = None) -> bool:
         """
-        Flush pending buffer rows to ClickHouse.
+        Enqueue a queue_job to flush buffered rows into ClickHouse.
 
-        Steps:
-          1) Fetch active ClickHouse configuration.
-          2) Atomically lock up to `batch_size` pending rows (SKIP LOCKED).
-          3) Deserialize JSON payloads; invalid payloads -> error.
-          4) Convert payloads to tuples in CH schema order.
-          5) INSERT into ClickHouse in batches.
-          6) Delete successfully flushed buffer rows.
+        This cron does not perform ClickHouse INSERTs directly. It only schedules
+        a job, so that queue_job can handle retries and high load.
 
-        :param batch_size: max number of buffer rows to process per run.
-        :return: True for cron compatibility.
+        :param batch_size: optional override; if not provided,
+          uses config.queue_batch_size.
+        :return: True (cron compatibility).
         """
-        started = time.monotonic()
-
         config = self.env["auditlog.clickhouse.config"].sudo().get_active_config()
         if not config:
-            _logger.warning("auditlog_clickhouse: flush skipped (no active config)")
+            _logger.debug("auditlog_clickhouse: cron flush skipped (no active config)")
             return True
 
-        client = config._get_client()
+        effective_batch = int(batch_size or config.queue_batch_size or 0) or 1000
 
-        total_flushed = 0
-        total_invalid = 0
-        total_inserted_logs = 0
-        total_inserted_lines = 0
-        batches = 0
+        if not self.sudo().search([("state", "=", self.STATE_PENDING)], limit=1):
+            _logger.debug(
+                "auditlog_clickhouse: cron flush skipped (no pending buffers)"
+            )
+            return True
 
-        while True:
-            if batches >= max_batches or (time.monotonic() - started) >= max_seconds:
-                break
-
-            pending_buffers = self.sudo()._lock_pending_buffers(batch_size)
-            if not pending_buffers:
-                break
-
-            batches += 1
-
-            log_rows: list[ChRow] = []
-            line_rows: list[ChRow] = []
-            invalid_buffers = self.browse()
-
-            for buffer_rec in pending_buffers:
-                try:
-                    payload: JsonMapping = json.loads(buffer_rec.payload_json)
-                except Exception as exc:
-                    buffer_rec._set_error(self.env._("Invalid JSON payload: %s") % exc)
-                    invalid_buffers |= buffer_rec
-                    continue
-
-                log_data = payload.get("log") or {}
-                lines_data = payload.get("lines") or []
-
-                if log_data:
-                    log_rows.append(self._build_ch_log_row(log_data))
-                for line_data in lines_data:
-                    line_rows.append(self._build_ch_line_row(line_data))
-
-            valid_buffers = pending_buffers - invalid_buffers
-            if invalid_buffers:
-                total_invalid += len(invalid_buffers)
-                _logger.warning(
-                    "auditlog_clickhouse: invalid JSON payloads=%s "
-                    "(marked error) (config=%s)",
-                    len(invalid_buffers),
-                    config.id,
-                )
-
-            if not valid_buffers:
-                continue
-
-            try:
-                if log_rows:
-                    client.execute(
-                        f"INSERT INTO {config.database}.auditlog_log ("
-                        f"{', '.join(self._CH_LOG_COLUMNS)}) VALUES",
-                        log_rows,
-                    )
-                if line_rows:
-                    client.execute(
-                        f"INSERT INTO {config.database}.auditlog_log_line ("
-                        f"{', '.join(self._CH_LINE_COLUMNS)}) VALUES",
-                        line_rows,
-                    )
-            except Exception as exc:
-                error_msg = self.env._("ClickHouse insert failed: %s") % exc
-                _logger.exception(
-                    "auditlog_clickhouse: INSERT failed "
-                    "(config=%s valid_buffers=%s log_rows=%s line_rows=%s)",
-                    config.id,
-                    len(valid_buffers),
-                    len(log_rows),
-                    len(line_rows),
-                )
-                valid_buffers._set_error(error_msg)
-                return True
-
-            flushed_count = len(valid_buffers)
-            valid_buffers.unlink()
-
-            total_flushed += flushed_count
-            total_inserted_logs += len(log_rows)
-            total_inserted_lines += len(line_rows)
+        channel_name = (
+            config.queue_channel_id.complete_name
+            if config.queue_channel_id
+            and getattr(config.queue_channel_id, "complete_name", None)
+            else "root"
+        )
 
         _logger.info(
-            "auditlog_clickhouse: flush finished "
-            "(config=%s batches=%s flushed_buffers=%s "
-            "inserted_logs=%s inserted_lines=%s invalid=%s) in %.3fs",
+            "auditlog_clickhouse: enqueue flush job "
+            "(config=%s channel=%s batch_size=%s)",
             config.id,
-            batches,
-            total_flushed,
-            total_inserted_logs,
-            total_inserted_lines,
-            total_invalid,
-            time.monotonic() - started,
+            channel_name,
+            effective_batch,
         )
+
+        self.sudo().with_delay(
+            channel=channel_name,
+            description=f"auditlog_clickhouse: flush buffers (config={config.id})",
+        )._job_flush_to_clickhouse(config.id, effective_batch)
+
         return True
+
+    @api.model
+    def _get_active_config_for_job(self, config_id: int):
+        config = self.env["auditlog.clickhouse.config"].sudo().browse(config_id)
+        if not config or not config.exists() or not config.is_active:
+            _logger.info(
+                "auditlog_clickhouse: job skipped "
+                "(config missing or not active) (config_id=%s)",
+                config_id,
+            )
+            return None
+        return config
+
+    @classmethod
+    def _payload_is_valid(cls, payload: Any) -> bool:
+        """Strict-enough validation to avoid endless RetryableJobError loops."""
+        if not isinstance(payload, dict):
+            return False
+
+        log_data = payload.get("log")
+        lines_data = payload.get("lines")
+
+        if not isinstance(log_data, dict) or not isinstance(lines_data, list):
+            return False
+
+        # Minimal required log fields (to avoid CH insert failures forever)
+        required = (
+            "id",
+            "model_id",
+            "model_model",
+            "user_id",
+            "method",
+            "create_date",
+            "create_uid",
+        )
+        for key in required:
+            if not log_data.get(key):
+                return False
+
+        # Lines must be a list of dicts (if any line is broken -> whole payload invalid)
+        return all(isinstance(line, dict) for line in lines_data)
+
+    def _collect_rows_from_buffers(self, buffers):
+        """Return (valid_buffers, invalid_buffers, log_rows, line_rows)."""
+        log_rows: list[ChRow] = []
+        line_rows: list[ChRow] = []
+        invalid_buffers = self.browse()
+
+        for rec in buffers:
+            payload = rec.payload_json
+
+            if not self._payload_is_valid(payload):
+                invalid_buffers |= rec
+                continue
+
+            log_data = payload["log"]
+            lines_data = payload["lines"]
+
+            log_rows.append(self._build_ch_log_row(log_data))
+            for line_data in lines_data:
+                line_rows.append(self._build_ch_line_row(line_data))
+
+        valid_buffers = buffers - invalid_buffers
+        return valid_buffers, invalid_buffers, log_rows, line_rows
+
+    def _mark_invalid_buffers(self, invalid_buffers, config) -> None:
+        if not invalid_buffers:
+            return
+        invalid_buffers._set_error(self.env._(self._INVALID_PAYLOAD_MESSAGE))
+        _logger.warning(
+            "auditlog_clickhouse: invalid payloads=%s (marked error) (config=%s)",
+            len(invalid_buffers),
+            config.id,
+        )
+
+    def _insert_rows_to_clickhouse(
+        self, client, config, log_rows, line_rows, valid_buffers
+    ):
+        try:
+            if log_rows:
+                client.execute(
+                    f"INSERT INTO {config.database}.auditlog_log ("
+                    f"{', '.join(self._CH_LOG_COLUMNS)}) VALUES",
+                    log_rows,
+                )
+            if line_rows:
+                client.execute(
+                    f"INSERT INTO {config.database}.auditlog_log_line ("
+                    f"{', '.join(self._CH_LINE_COLUMNS)}) VALUES",
+                    line_rows,
+                )
+        except Exception as exc:
+            _logger.exception(
+                "auditlog_clickhouse: INSERT failed (will retry) "
+                "(config=%s buffers=%s logs=%s lines=%s)",
+                config.id,
+                len(valid_buffers),
+                len(log_rows),
+                len(line_rows),
+            )
+            raise RetryableJobError(
+                f"ClickHouse insert failed: {exc}",
+                seconds=60,
+            ) from exc
+
+    def _delete_flushed_buffers(self, valid_buffers, config) -> None:
+        try:
+            valid_buffers.unlink()
+        except Exception as exc:
+            _logger.exception(
+                "auditlog_clickhouse: failed to delete flushed buffers "
+                "(config=%s buffers=%s)",
+                config.id,
+                len(valid_buffers),
+            )
+            valid_buffers._set_error(
+                self.env._("Flushed to ClickHouse but failed to delete buffer rows: %s")
+                % exc
+            )
+        else:
+            _logger.info(
+                "auditlog_clickhouse: job flushed batch "
+                "(config=%s flushed_buffers=%s)",
+                config.id,
+                len(valid_buffers),
+            )
+
+    def _enqueue_next_flush_job_if_needed(self, config, batch_size: int) -> None:
+        if not self.sudo().search([("state", "=", self.STATE_PENDING)], limit=1):
+            return
+
+        channel_name = (
+            config.queue_channel_id.complete_name
+            if config.queue_channel_id
+            and getattr(config.queue_channel_id, "complete_name", None)
+            else "root"
+        )
+        _logger.debug(
+            "auditlog_clickhouse: more pending buffers detected, enqueue next job "
+            "(config=%s channel=%s batch_size=%s)",
+            config.id,
+            channel_name,
+            batch_size,
+        )
+        self.sudo().with_delay(
+            channel=channel_name,
+            description=f"auditlog_clickhouse: flush buffers (config={config.id})",
+        )._job_flush_to_clickhouse(config.id, int(batch_size))
+
+    @api.model
+    def _job_flush_to_clickhouse(self, config_id: int, batch_size: int) -> None:
+        """
+        Queue job: flush one batch of pending buffers into ClickHouse.
+
+        - Locks pending buffers (SKIP LOCKED)
+        - Validates payload structure
+        - Builds CH rows
+        - INSERTs into CH (retryable)
+        - Deletes flushed buffers
+        - Marks invalid payloads as error (non-retryable)
+        - Enqueues next job if more pending exist
+        """
+        config = self._get_active_config_for_job(config_id)
+        if not config:
+            return
+
+        pending_buffers = self.sudo()._lock_pending_buffers(int(batch_size))
+        if not pending_buffers:
+            _logger.debug(
+                "auditlog_clickhouse: job no-op (no pending buffers) (config=%s)",
+                config.id,
+            )
+            return
+
+        valid_buffers, invalid_buffers, log_rows, line_rows = (
+            self._collect_rows_from_buffers(pending_buffers)
+        )
+
+        # Nothing valid: just mark invalids and exit successfully.
+        if not valid_buffers:
+            self._mark_invalid_buffers(invalid_buffers, config)
+            return
+
+        client = config._get_client()
+        self._insert_rows_to_clickhouse(
+            client=client,
+            config=config,
+            log_rows=log_rows,
+            line_rows=line_rows,
+            valid_buffers=valid_buffers,
+        )
+
+        # Delete flushed buffers; if deletion fails,
+        # mark them as error to avoid re-inserts.
+        self._delete_flushed_buffers(valid_buffers, config)
+
+        # Mark invalid ones only after successful CH insert
+        # (so RetryableJobError doesn't rollback the marking)
+        self._mark_invalid_buffers(invalid_buffers, config)
+
+        # Continue draining queue
+        self._enqueue_next_flush_job_if_needed(config, int(batch_size))
 
     @classmethod
     def _build_ch_log_row(cls, log_data: JsonMapping) -> ChRow:

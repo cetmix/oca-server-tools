@@ -17,21 +17,25 @@ class AuditlogClickhouseConfig(models.Model):
       - Only one configuration can be active at a time.
       - UI provides tools to test the connection and (optionally) create tables.
 
-    Security note:
-      - This model is intended for technical users (auditlog manager).
-      - Password is stored in DB (standard Odoo behavior for such wizards/settings).
+    Notes:
+      - As soon as a configuration becomes active, audit log entries will be stored
+        in the configured ClickHouse database from that moment.
     """
 
     _name = "auditlog.clickhouse.config"
     _description = "Auditlog ClickHouse Configuration"
-    _rec_name = "database"
+    _rec_name = "display_name"
 
     DEFAULT_PORT = 9000
     DEFAULT_DB = "odoo_audit"
     DEFAULT_USER = "odoo_audit_writer"
+    DEFAULT_QUEUE_BATCH_SIZE = 1000
 
     is_active = fields.Boolean(
-        help="If unchecked, no audit logs will be flushed to ClickHouse.",
+        help=(
+            "If checked audit logs will be buffered locally and exported to ClickHouse."
+            " Only one configuration can be active at a time."
+        ),
     )
     host = fields.Char(
         string="Hostname or IP",
@@ -68,6 +72,27 @@ class AuditlogClickhouseConfig(models.Model):
     )
     password = fields.Char(
         help="Password for the ClickHouse user.",
+    )
+
+    queue_batch_size = fields.Integer(
+        string="Batch size",
+        default=DEFAULT_QUEUE_BATCH_SIZE,
+        required=True,
+        help="Maximum number of buffer rows processed per queue job run.",
+    )
+
+    def _default_queue_channel(self):
+        Channel = self.env["queue.job.channel"].sudo()
+        channel = Channel.search([("complete_name", "=", "root")], limit=1)
+        return channel
+
+    queue_channel_id = fields.Many2one(
+        comodel_name="queue.job.channel",
+        string="Channel",
+        required=True,
+        default=_default_queue_channel,
+        ondelete="restrict",
+        help="queue_job channel used for export jobs.",
     )
 
     @api.depends("host", "port", "database", "user", "is_active")
@@ -110,12 +135,20 @@ class AuditlogClickhouseConfig(models.Model):
     @api.onchange("is_active")
     def _onchange_is_active(self):
         """
-        Warn user that only one config can be active;
-        others will be deactivated on save.
+        Show disclaimer immediately when user enables the checkbox.
+
+        If another active configuration exists, also warn that it will be
+        deactivated after saving.
         """
         for rec in self:
-            if not rec.is_active:
+            if not rec.is_active or (rec._origin and rec._origin.is_active):
                 continue
+
+            disclaimer = rec.env._(
+                "As soon as this connection to ClickHouse is activated, all log entries"
+                " from that moment will be stored in the configured ClickHouse"
+                " database.\n\n Only one connection can be active at a time."
+            )
 
             domain = [("is_active", "=", True)]
             if rec.id:
@@ -123,17 +156,23 @@ class AuditlogClickhouseConfig(models.Model):
 
             other = rec.env["auditlog.clickhouse.config"].sudo().search(domain, limit=1)
             if other:
+                message = rec.env._(
+                    "%s\n\nIf you save this configuration as active, "
+                    "the currently active one will be deactivated:\n- %s"
+                ) % (disclaimer, other.display_name)
                 return {
                     "warning": {
-                        "title": rec.env._("Only one active connection"),
-                        "message": rec.env._(
-                            "Only one ClickHouse connection can be active at a time\n\n"
-                            "If you save this configuration as active, "
-                            "the currently active one will be deactivated:\n- %s"
-                        )
-                        % (other.display_name,),
+                        "title": rec.env._("ClickHouse activation"),
+                        "message": message,
                     }
                 }
+
+            return {
+                "warning": {
+                    "title": rec.env._("ClickHouse activation"),
+                    "message": disclaimer,
+                }
+            }
 
     @api.model_create_multi
     def create(self, vals_list: list[dict[str, Any]]):

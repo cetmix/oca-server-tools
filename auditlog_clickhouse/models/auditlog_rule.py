@@ -1,13 +1,9 @@
-import json
 import logging
 import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import date, datetime, timezone
-from typing import (
-    Any,
-    TypedDict,
-)
+from typing import Any, TypedDict
 
 from odoo import models
 
@@ -60,6 +56,37 @@ def _json_default(obj: Any) -> str:
     if isinstance(obj, datetime | date):
         return obj.isoformat()
     return str(obj)
+
+
+def _json_sanitize(obj: Any) -> Any:
+    """
+    Convert values to JSON-serializable structures.
+
+    This is used when writing payloads into a `fields.Json` column:
+      - datetime/date -> ISO string
+      - recordsets -> list of ids
+      - mappings/sequences -> recursively sanitized
+      - other unknown types -> string representation
+    """
+    if obj is None or isinstance(obj, (str | int | float | bool)):
+        return obj
+
+    if isinstance(obj, (datetime | date)):
+        return obj.isoformat()
+
+    if isinstance(obj, bytes):
+        return obj.decode("utf-8", errors="replace")
+
+    if isinstance(obj, models.BaseModel):
+        return list(obj.ids)
+
+    if isinstance(obj, Mapping):
+        return {str(k): _json_sanitize(v) for k, v in obj.items()}
+
+    if isinstance(obj, (list | tuple | set)):
+        return [_json_sanitize(v) for v in obj]
+
+    return _json_default(obj)
 
 
 class AuditlogRule(models.Model):
@@ -170,7 +197,7 @@ class AuditlogRule(models.Model):
         res_model: str,
         res_ids: Sequence[int],
         base_log: _PayloadLog,
-    ) -> dict[str, Any]:
+    ) -> _Payload:
         """
         Build a payload for the `export_data` audit method.
 
@@ -356,17 +383,14 @@ class AuditlogRule(models.Model):
 
         return lines
 
-    def _dump_payload_json(self, payload: dict[str, Any]) -> str:
+    def _dump_payload_json(self, payload: dict[str, Any]) -> dict[str, Any]:
         """
-        Serialize a payload dict to JSON for storing in the PostgreSQL buffer.
+        Prepare payload for storing in the PostgreSQL buffer.
 
-        Args:
-            payload: Payload dict with structure {"log": ..., "lines": ...}.
-
-        Returns:
-            JSON string ready to be written into `auditlog.log.buffer.payload_json`.
+        Buffer field is `fields.Json`, so we store a dict, not a JSON string.
+        We sanitize values to ensure the structure is JSON-serializable.
         """
-        return json.dumps(payload, ensure_ascii=False, default=_json_default)
+        return _json_sanitize(payload)
 
     def _buffer_create_or_log(
         self,

@@ -27,6 +27,14 @@ class AuditLogClickhouseCommon(TransactionCase):
         super().setUpClass()
         cls._patched_models = set()
         cls._created_rules = cls.env["auditlog.rule"]
+
+        # Clean start (important when suites run in one process)
+        cls.env["auditlog.clickhouse.config"].sudo().search([]).write(
+            {"is_active": False}
+        )
+        cls.env["auditlog.log.buffer"].sudo().search([]).unlink()
+
+        # For OUR tests we need active config
         cls.base_cfg = cls.create_config(is_active=True)
 
     @classmethod
@@ -57,21 +65,31 @@ class AuditLogClickhouseCommon(TransactionCase):
 
     @classmethod
     def tearDownClass(cls):
-        # Unsubscribe rules created by this test module (avoid leaving patched methods).
-        for rule in cls._created_rules:
-            try:
-                rule.unsubscribe()
-            except KeyError:
-                continue
+        try:
+            # Avoid leaking to other modules (auditlog)
+            cls.env["auditlog.clickhouse.config"].sudo().search([]).write(
+                {"is_active": False}
+            )
+            cls.env["auditlog.log.buffer"].sudo().search([]).unlink()
 
-        # Assert no patched methods remain.
-        for model in cls._patched_models:
-            for method in ["create", "read", "write", "unlink"]:
-                assert not hasattr(
-                    getattr(cls.env[model], method), "origin"
-                ), f"{model} {method} still patched"
+            for rule in getattr(cls, "_created_rules", cls.env["auditlog.rule"]).sudo():
+                try:
+                    if rule.exists():
+                        rule.unsubscribe()
+                except KeyError:
+                    continue
 
-        super().tearDownClass()
+            for model in getattr(cls, "_patched_models", set()):
+                model_rs = cls.env[model]
+                for method in ("create", "read", "write", "unlink", "export_data"):
+                    func = getattr(model_rs, method, None)
+                    if func is None:
+                        continue
+                    assert not hasattr(
+                        func, "origin"
+                    ), f"{model} {method} still patched"
+        finally:
+            super().tearDownClass()
 
     @contextlib.contextmanager
     def _patched_clickhouse_client(self, *, raise_on_insert: bool = False):
@@ -87,4 +105,4 @@ class AuditLogClickhouseCommon(TransactionCase):
     def _parse_payloads(self):
         """Return list of decoded payload dicts from buffer (oldest first)."""
         buf = self.env["auditlog.log.buffer"].sudo().search([], order="id asc")
-        return [__import__("json").loads(r.payload_json) for r in buf]
+        return [r.payload_json for r in buf]

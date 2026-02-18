@@ -1,5 +1,3 @@
-import json
-
 from odoo.tests import tagged
 from odoo.tools import mute_logger
 
@@ -12,7 +10,6 @@ class TestAuditlogClickhouseBuffer(AuditLogClickhouseCommon):
     def setUpClass(cls):
         super().setUpClass()
         cls.groups_model_id = cls.env.ref("base.model_res_groups").id
-        cls.partner_model_id = cls.env.ref("base.model_res_partner").id
 
         # Rule for groups: full logging
         cls.groups_rule = cls.create_rule(
@@ -29,9 +26,11 @@ class TestAuditlogClickhouseBuffer(AuditLogClickhouseCommon):
             }
         )
 
+        # Active config to enable buffering
+        cls.config = cls.create_config(is_active=True)
+
     def setUp(self):
         super().setUp()
-        # Ensure rule is subscribed per test.
         self.groups_rule.subscribe()
 
     def test_01_create_writes_to_buffer_not_auditlog_tables(self):
@@ -55,7 +54,7 @@ class TestAuditlogClickhouseBuffer(AuditLogClickhouseCommon):
         )
         self.assertEqual(buf.search_count([]) - start_buf, 1)
 
-        payload = json.loads(buf.search([], order="id desc", limit=1).payload_json)
+        payload = buf.search([], order="id desc", limit=1).payload_json
         self.assertEqual(payload["log"]["method"], "create")
         self.assertEqual(payload["log"]["model_id"], self.groups_model_id)
         self.assertEqual(payload["log"]["res_id"], group.id)
@@ -69,7 +68,7 @@ class TestAuditlogClickhouseBuffer(AuditLogClickhouseCommon):
 
         self.assertGreater(buf.search_count([]), start_buf)
 
-        payload = json.loads(buf.search([], order="id desc", limit=1).payload_json)
+        payload = buf.search([], order="id desc", limit=1).payload_json
         self.assertEqual(payload["log"]["method"], "write")
         self.assertEqual(payload["log"]["model_model"], "res.groups")
 
@@ -83,7 +82,7 @@ class TestAuditlogClickhouseBuffer(AuditLogClickhouseCommon):
         self.env["res.groups"].search([]).export_data(["name"])
 
         self.assertEqual(buf.search_count([]) - start_buf, 1)
-        payload = json.loads(buf.search([], order="id desc", limit=1).payload_json)
+        payload = buf.search([], order="id desc", limit=1).payload_json
         self.assertEqual(payload["log"]["method"], "export_data")
         self.assertEqual(payload["lines"], [])
 
@@ -99,21 +98,20 @@ class TestAuditlogClickhouseBuffer(AuditLogClickhouseCommon):
         g.unlink()
 
         self.assertGreater(buf.search_count([]), start_buf)
-        payload = json.loads(buf.search([], order="id desc", limit=1).payload_json)
+        payload = buf.search([], order="id desc", limit=1).payload_json
         self.assertEqual(payload["log"]["method"], "unlink")
-        # capture_record=False => lines may be empty, but payload must exist
         self.assertIsInstance(payload["lines"], list)
 
 
 @tagged("-at_install", "post_install")
-class TestAuditlogClickhouseCron(AuditLogClickhouseCommon):
+class TestAuditlogClickhouseQueueJobs(AuditLogClickhouseCommon):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
         cls.partner_model_id = cls.env.ref("base.model_res_partner").id
         cls.rule = cls.create_rule(
             {
-                "name": "testrule partner clickhouse cron",
+                "name": "testrule partner clickhouse queue",
                 "model_id": cls.partner_model_id,
                 "log_create": True,
                 "log_write": True,
@@ -127,85 +125,227 @@ class TestAuditlogClickhouseCron(AuditLogClickhouseCommon):
         super().setUp()
         self.rule.subscribe()
 
-    def test_01_cron_flush_success_deletes_buffers_and_calls_insert(self):
+    def test_01_cron_enqueues_job_and_does_not_flush_inline(self):
+        """
+        Cron must only enqueue queue.job (no direct ClickHouse INSERTs here).
+        """
+        buf = self.env["auditlog.log.buffer"].sudo()
+        job_model = self.env["queue.job"].sudo()
+
+        partner = (
+            self.env["res.partner"]
+            .with_context(tracking_disable=True)
+            .create({"name": "Cron Enqueue Test"})
+        )
+        partner.with_context(tracking_disable=True).write(
+            {"name": "Cron Enqueue Test v2"}
+        )
+
+        self.assertGreater(buf.search_count([]), 0)
+
+        start_jobs = job_model.search_count([])
+        res = buf._cron_flush_to_clickhouse()  # uses config.queue_batch_size
+
+        self.assertTrue(res)
+        self.assertEqual(
+            job_model.search_count([]) - start_jobs,
+            1,
+            "Cron must enqueue exactly one job",
+        )
+
+        job = job_model.search([], order="id desc", limit=1)
+        self.assertEqual(job.model_name, "auditlog.log.buffer")
+        self.assertEqual(job.method_name, "_job_flush_to_clickhouse")
+        self.assertEqual(job.args[0], self.config.id)
+        self.assertEqual(job.args[1], self.config.queue_batch_size)
+
+        expected_channel = (
+            self.config.queue_channel_id.complete_name
+            if self.config.queue_channel_id
+            else "root"
+        )
+        self.assertEqual(job.channel, expected_channel)
+
+    def test_02_cron_skips_when_no_pending_buffers(self):
+        buf = self.env["auditlog.log.buffer"].sudo()
+        job_model = self.env["queue.job"].sudo()
+
+        # Ensure no pending buffers
+        buf.search([]).unlink()
+
+        start_jobs = job_model.search_count([])
+        res = buf._cron_flush_to_clickhouse()
+
+        self.assertTrue(res)
+        self.assertEqual(
+            job_model.search_count([]) - start_jobs, 0, "No pending buffers -> no job"
+        )
+
+    def test_03_cron_skips_without_active_config(self):
+        self.env["auditlog.clickhouse.config"].search([]).write({"is_active": False})
+
+        buf = self.env["auditlog.log.buffer"].sudo()
+        job_model = self.env["queue.job"].sudo()
+
+        start_jobs = job_model.search_count([])
+        rec = buf.create(
+            {"payload_json": {"log": {}, "lines": []}, "state": buf.STATE_PENDING}
+        )
+
+        res = buf._cron_flush_to_clickhouse()
+
+        self.assertTrue(res)
+        self.assertEqual(
+            job_model.search_count([]) - start_jobs, 0, "No active config -> no job"
+        )
+
+        rec.invalidate_recordset()
+        self.assertEqual(rec.state, buf.STATE_PENDING)
+        self.assertFalse(rec.error_message)
+
+    def test_04_job_flush_success_deletes_buffers_and_calls_insert(self):
         buf = self.env["auditlog.log.buffer"].sudo()
 
         partner = (
             self.env["res.partner"]
             .with_context(tracking_disable=True)
-            .create({"name": "Cron Test"})
+            .create({"name": "Job Flush OK"})
         )
-        partner.with_context(tracking_disable=True).write({"name": "Cron Test v2"})
+        partner.with_context(tracking_disable=True).write({"name": "Job Flush OK v2"})
 
         self.assertGreater(buf.search_count([]), 0)
 
         with self._patched_clickhouse_client() as dummy:
-            buf._cron_flush_to_clickhouse(batch_size=1000)
+            buf._job_flush_to_clickhouse(self.config.id, self.config.queue_batch_size)
 
         self.assertEqual(
-            buf.search_count([]), 0, "Buffers must be removed after successful flush"
+            buf.search_count([]),
+            0,
+            "Buffers must be removed after successful job flush",
         )
 
-        # Assert we did at least one INSERT call.
         insert_calls = [
-            q for (q, params) in dummy.calls if "INSERT INTO" in (q or "").upper()
+            q for (q, _params) in dummy.calls if "INSERT INTO" in (q or "").upper()
         ]
-        self.assertTrue(insert_calls, "Cron must insert into ClickHouse")
+        self.assertTrue(insert_calls, "Job must insert into ClickHouse")
 
-    def test_02_cron_invalid_json_marks_error_and_keeps_row(self):
+    def test_05_job_invalid_payload_marks_error_and_keeps_row(self):
         buf = self.env["auditlog.log.buffer"].sudo()
+
+        # Invalid structure for payload_json (Json field accepts string,
+        # but our code expects mapping with log/lines)
         rec = buf.create(
-            {
-                "payload_json": "NOT A JSON",
-                "state": buf.STATE_PENDING,
-            }
+            {"payload_json": "NOT A JSON OBJECT", "state": buf.STATE_PENDING}
         )
 
-        with self._patched_clickhouse_client() as dummy:
-            with mute_logger(
-                "odoo.addons.auditlog_clickhouse.models.auditlog_log_buffer"
-            ):
-                res = buf._cron_flush_to_clickhouse(batch_size=1000)
-
-        self.assertTrue(res)
+        with mute_logger("odoo.addons.auditlog_clickhouse.models.auditlog_log_buffer"):
+            buf._job_flush_to_clickhouse(self.config.id, batch_size=10)
 
         rec.invalidate_recordset()
         self.assertEqual(rec.state, buf.STATE_ERROR)
         self.assertTrue(rec.error_message)
         self.assertGreaterEqual(rec.attempt_count, 1)
 
-        insert_calls = [
-            q for (q, _params) in dummy.calls if "INSERT INTO" in (q or "").upper()
-        ]
-        self.assertFalse(insert_calls)
 
-    @mute_logger("odoo.addons.auditlog_clickhouse.models.auditlog_log_buffer")
-    def test_03_cron_insert_failure_marks_pending_as_error(self):
-        buf = self.env["auditlog.log.buffer"].sudo()
+@tagged("-at_install", "post_install", "test1")
+class TestAuditlogClickhouseConfig(AuditLogClickhouseCommon):
+    def test_01_single_active_on_create(self):
+        cfg1 = self.create_config(is_active=True, host="h1")
+        cfg2 = self.create_config(is_active=True, host="h2")
 
-        partner = (
-            self.env["res.partner"]
-            .with_context(tracking_disable=True)
-            .create({"name": "Fail Test"})
+        cfg1.invalidate_recordset()
+        cfg2.invalidate_recordset()
+
+        active = self.env["auditlog.clickhouse.config"].search(
+            [("is_active", "=", True)]
         )
-        partner.with_context(tracking_disable=True).write({"name": "Fail Test v2"})
+        self.assertEqual(len(active), 1)
+        self.assertTrue(cfg2.is_active)
+        self.assertFalse(cfg1.is_active)
 
-        pending = buf.search([("state", "=", "pending")])
-        self.assertTrue(pending, "Expected pending buffer rows to be created")
+    def test_02_single_active_on_write(self):
+        cfg1 = self.create_config(is_active=False, host="h1")
+        cfg2 = self.create_config(is_active=True, host="h2")
 
-        with self._patched_clickhouse_client(raise_on_insert=True):
-            res = buf._cron_flush_to_clickhouse(batch_size=1000)
+        cfg1.write({"is_active": True})
+        cfg1.invalidate_recordset()
+        cfg2.invalidate_recordset()
 
-        self.assertTrue(res)
+        active = self.env["auditlog.clickhouse.config"].search(
+            [("is_active", "=", True)]
+        )
+        self.assertEqual(len(active), 1)
+        self.assertTrue(cfg1.is_active)
+        self.assertFalse(cfg2.is_active)
 
-        # Re-read from DB
-        errored = buf.search([("id", "in", pending.ids), ("state", "=", "error")])
+    def test_03_test_connection_uses_client(self):
+        cfg = self.create_config(is_active=True)
+
+        with self._patched_clickhouse_client() as dummy:
+            action = cfg.action_test_connection()
+
+        self.assertTrue(action)
+        self.assertTrue(any("SELECT 1" in (q or "") for (q, _params) in dummy.calls))
+
+    def test_04_queue_channel_field_is_m2o_and_default_is_root(self):
+        cfg = self.create_config(is_active=False)
+
         self.assertEqual(
-            len(errored),
-            len(pending),
-            "All pending buffer rows must be marked as error on insert failure",
+            cfg._fields["queue_channel_id"].comodel_name,
+            "queue.job.channel",
+            "queue_channel_id must be a Many2one to queue.job.channel",
         )
 
-        # Ensure they were not deleted
-        remaining = buf.search([("id", "in", pending.ids)])
-        self.assertEqual(len(remaining), len(pending))
+        root = self.env["queue.job.channel"].search(
+            [("complete_name", "=", "root")], limit=1
+        )
+        self.assertTrue(root, "queue_job must provide root channel")
+        self.assertEqual(
+            cfg.queue_channel_id.id, root.id, "Default queue channel must be root"
+        )
+
+    def test_05_onchange_is_active_shows_disclaimer(self):
+        # Create an active config so onchange also mentions it
+        active = self.create_config(is_active=True, host="active-host")
+
+        new_cfg = self.env["auditlog.clickhouse.config"].new(
+            {
+                "is_active": True,
+                "host": "h-new",
+                "port": 9000,
+                "database": "db",
+                "user": "u",
+            }
+        )
+        res = new_cfg._onchange_is_active()
+
+        self.assertTrue(
+            res and res.get("warning"),
+            "Onchange must return warning when enabling is_active",
+        )
+        msg = res["warning"]["message"]
+        self.assertIn("As soon as this connection to ClickHouse is activated", msg)
+        self.assertIn("Only one connection can be active at a time", msg)
+        self.assertIn(active.display_name, msg)
+
+    def test_06_cron_uses_overridden_batch_size_argument(self):
+        cfg = self.create_config(is_active=True)
+        cfg.write({"queue_batch_size": 777})
+
+        buf = self.env["auditlog.log.buffer"].sudo()
+        job_model = self.env["queue.job"].sudo()
+
+        buf.create(
+            {"payload_json": {"log": {}, "lines": []}, "state": buf.STATE_PENDING}
+        )
+
+        start_jobs = job_model.search_count([])
+        buf._cron_flush_to_clickhouse(batch_size=10)
+
+        self.assertEqual(job_model.search_count([]) - start_jobs, 1)
+        job = job_model.search([], order="id desc", limit=1)
+        self.assertEqual(
+            job.args[1],
+            10,
+            "Explicit cron batch_size must override config.queue_batch_size",
+        )
