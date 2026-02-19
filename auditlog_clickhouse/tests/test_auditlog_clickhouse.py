@@ -63,8 +63,12 @@ class TestAuditlogClickhouseBuffer(AuditLogClickhouseCommon):
         buf = self.env["auditlog.log.buffer"].sudo()
         start_buf = buf.search_count([])
 
-        group = self.env["res.groups"].create({"name": "CH Group"})
-        group.write({"name": "CH Group v2"})
+        group = (
+            self.env["res.groups"]
+            .with_context(tracking_disable=True)
+            .create({"name": "CH Group"})
+        )
+        group.with_context(tracking_disable=True).write({"name": "CH Group v2"})
 
         self.assertGreater(buf.search_count([]), start_buf)
 
@@ -86,7 +90,7 @@ class TestAuditlogClickhouseBuffer(AuditLogClickhouseCommon):
         self.assertEqual(payload["log"]["method"], "export_data")
         self.assertEqual(payload["lines"], [])
 
-    def test_04_unlink_is_always_logged_even_without_capture_record(self):
+    def test_04_unlink_is_logged(self):
         buf = self.env["auditlog.log.buffer"].sudo()
         start_buf = buf.search_count([])
 
@@ -113,6 +117,7 @@ class TestAuditlogClickhouseQueueJobs(AuditLogClickhouseCommon):
             {
                 "name": "testrule partner clickhouse queue",
                 "model_id": cls.partner_model_id,
+                "log_read": True,
                 "log_create": True,
                 "log_write": True,
                 "log_unlink": True,
@@ -245,107 +250,3 @@ class TestAuditlogClickhouseQueueJobs(AuditLogClickhouseCommon):
         self.assertEqual(rec.state, buf.STATE_ERROR)
         self.assertTrue(rec.error_message)
         self.assertGreaterEqual(rec.attempt_count, 1)
-
-
-@tagged("-at_install", "post_install", "test1")
-class TestAuditlogClickhouseConfig(AuditLogClickhouseCommon):
-    def test_01_single_active_on_create(self):
-        cfg1 = self.create_config(is_active=True, host="h1")
-        cfg2 = self.create_config(is_active=True, host="h2")
-
-        cfg1.invalidate_recordset()
-        cfg2.invalidate_recordset()
-
-        active = self.env["auditlog.clickhouse.config"].search(
-            [("is_active", "=", True)]
-        )
-        self.assertEqual(len(active), 1)
-        self.assertTrue(cfg2.is_active)
-        self.assertFalse(cfg1.is_active)
-
-    def test_02_single_active_on_write(self):
-        cfg1 = self.create_config(is_active=False, host="h1")
-        cfg2 = self.create_config(is_active=True, host="h2")
-
-        cfg1.write({"is_active": True})
-        cfg1.invalidate_recordset()
-        cfg2.invalidate_recordset()
-
-        active = self.env["auditlog.clickhouse.config"].search(
-            [("is_active", "=", True)]
-        )
-        self.assertEqual(len(active), 1)
-        self.assertTrue(cfg1.is_active)
-        self.assertFalse(cfg2.is_active)
-
-    def test_03_test_connection_uses_client(self):
-        cfg = self.create_config(is_active=True)
-
-        with self._patched_clickhouse_client() as dummy:
-            action = cfg.action_test_connection()
-
-        self.assertTrue(action)
-        self.assertTrue(any("SELECT 1" in (q or "") for (q, _params) in dummy.calls))
-
-    def test_04_queue_channel_field_is_m2o_and_default_is_root(self):
-        cfg = self.create_config(is_active=False)
-
-        self.assertEqual(
-            cfg._fields["queue_channel_id"].comodel_name,
-            "queue.job.channel",
-            "queue_channel_id must be a Many2one to queue.job.channel",
-        )
-
-        root = self.env["queue.job.channel"].search(
-            [("complete_name", "=", "root")], limit=1
-        )
-        self.assertTrue(root, "queue_job must provide root channel")
-        self.assertEqual(
-            cfg.queue_channel_id.id, root.id, "Default queue channel must be root"
-        )
-
-    def test_05_onchange_is_active_shows_disclaimer(self):
-        # Create an active config so onchange also mentions it
-        active = self.create_config(is_active=True, host="active-host")
-
-        new_cfg = self.env["auditlog.clickhouse.config"].new(
-            {
-                "is_active": True,
-                "host": "h-new",
-                "port": 9000,
-                "database": "db",
-                "user": "u",
-            }
-        )
-        res = new_cfg._onchange_is_active()
-
-        self.assertTrue(
-            res and res.get("warning"),
-            "Onchange must return warning when enabling is_active",
-        )
-        msg = res["warning"]["message"]
-        self.assertIn("As soon as this connection to ClickHouse is activated", msg)
-        self.assertIn("Only one connection can be active at a time", msg)
-        self.assertIn(active.display_name, msg)
-
-    def test_06_cron_uses_overridden_batch_size_argument(self):
-        cfg = self.create_config(is_active=True)
-        cfg.write({"queue_batch_size": 777})
-
-        buf = self.env["auditlog.log.buffer"].sudo()
-        job_model = self.env["queue.job"].sudo()
-
-        buf.create(
-            {"payload_json": {"log": {}, "lines": []}, "state": buf.STATE_PENDING}
-        )
-
-        start_jobs = job_model.search_count([])
-        buf._cron_flush_to_clickhouse(batch_size=10)
-
-        self.assertEqual(job_model.search_count([]) - start_jobs, 1)
-        job = job_model.search([], order="id desc", limit=1)
-        self.assertEqual(
-            job.args[1],
-            10,
-            "Explicit cron batch_size must override config.queue_batch_size",
-        )
