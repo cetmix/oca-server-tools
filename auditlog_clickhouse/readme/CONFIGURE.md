@@ -28,4 +28,4 @@ Steps:
 | channel_id (default root) |
 
 - Click **Test connection**.
-- Optionally, click **Create Auditlog Tables** to create the tables and User in the target database.
+- Optionally, click **Create Auditlog Tables** to create the tables in the target database.

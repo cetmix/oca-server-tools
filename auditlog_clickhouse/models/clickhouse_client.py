@@ -6,7 +6,7 @@ from odoo.exceptions import UserError
 
 try:
     from clickhouse_driver import Client as ClickHouseClient
-except Exception:
+except ImportError:
     ClickHouseClient = None
 
 

@@ -1,5 +1,5 @@
 # generated from manifests external_dependencies
-clickhouse_driver
+clickhouse-driver
 cryptography
 dataclasses
 odoo_test_helper

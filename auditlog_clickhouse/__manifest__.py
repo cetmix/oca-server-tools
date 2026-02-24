@@ -11,7 +11,7 @@
         "queue_job",
     ],
     "external_dependencies": {
-        "python": ["clickhouse_driver"],
+        "python": ["clickhouse-driver"],
     },
     "data": [
         "security/ir.model.access.csv",

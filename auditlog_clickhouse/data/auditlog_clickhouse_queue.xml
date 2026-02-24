@@ -14,7 +14,7 @@
         id="action_configure_auditlog_clickhouse_cron"
         model="ir.actions.act_window"
     >
-        <field name="name">Edit export action</field>
+        <field name="name">Edit buffer flush schedule</field>
         <field name="res_model">ir.cron</field>
         <field
             name="res_id"
