@@ -56,6 +56,8 @@ class AuditlogLogBuffer(models.Model):
         "log_type",
         "create_date",
         "create_uid",
+        "write_date",
+        "write_uid",
     )
     _CH_LINE_COLUMNS: tuple[str, ...] = (
         "id",
@@ -69,6 +71,8 @@ class AuditlogLogBuffer(models.Model):
         "new_value_text",
         "create_date",
         "create_uid",
+        "write_date",
+        "write_uid",
     )
 
     _INVALID_PAYLOAD_MESSAGE = (
@@ -429,20 +433,30 @@ class AuditlogLogBuffer(models.Model):
     def _build_ch_log_row(cls, log_data: JsonMapping) -> ChRow:
         """Convert payload['log'] dict into CH tuple (order matches _CH_LOG_COLUMNS)."""
         return (
-            log_data.get("id"),
+            int(log_data.get("id") or 0),
             cls._to_ch_nullable_string(log_data.get("name")),
             int(log_data.get("model_id") or 0),
             cls._to_ch_nullable_string(log_data.get("model_name")),
             (log_data.get("model_model") or "unknown"),
-            log_data.get("res_id"),
+            int(log_data.get("res_id") or 0)
+            if log_data.get("res_id") is not None
+            else None,
             cls._to_ch_nullable_string(log_data.get("res_ids")),
             int(log_data.get("user_id") or 0),
             (log_data.get("method") or "unknown"),
-            log_data.get("http_request_id"),
-            log_data.get("http_session_id"),
+            int(log_data.get("http_request_id") or 0)
+            if log_data.get("http_request_id") is not None
+            else None,
+            int(log_data.get("http_session_id") or 0)
+            if log_data.get("http_session_id") is not None
+            else None,
             cls._to_ch_nullable_string(log_data.get("log_type")),
             cls._to_ch_datetime_utc(log_data.get("create_date")),
             int(log_data.get("create_uid") or 0),
+            cls._to_ch_datetime_utc(log_data.get("write_date")),
+            int(log_data.get("write_uid") or 0)
+            if log_data.get("write_uid") is not None
+            else None,
         )
 
     @classmethod
@@ -452,8 +466,8 @@ class AuditlogLogBuffer(models.Model):
         tuple (order matches _CH_LINE_COLUMNS).
         """
         return (
-            line_data.get("id"),
-            line_data.get("log_id"),
+            int(line_data.get("id") or 0),
+            int(line_data.get("log_id") or 0),
             int(line_data.get("field_id") or 0),
             cls._to_ch_nullable_string(line_data.get("field_name")),
             cls._to_ch_nullable_string(line_data.get("field_description")),
@@ -463,4 +477,8 @@ class AuditlogLogBuffer(models.Model):
             cls._to_ch_nullable_string(line_data.get("new_value_text")),
             cls._to_ch_datetime_utc(line_data.get("create_date")),
             int(line_data.get("create_uid") or 0),
+            cls._to_ch_datetime_utc(line_data.get("write_date")),
+            int(line_data.get("write_uid") or 0)
+            if line_data.get("write_uid") is not None
+            else None,
         )

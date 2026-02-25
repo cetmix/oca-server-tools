@@ -33,7 +33,10 @@ from PostgreSQL to ClickHouse. Storing audit data in a columnar database
 that is write-only prevents database bloat, makes audit records
 effectively immutable, and allows for scaling to very large volumes of
 logs without slowing down normal transactions. Audit logs are written
-asynchronously to reduce the load on business operations.
+asynchronously to reduce the load on business operations. Audit logs
+stored in ClickHouse are displayed in standard Odoo audit log views
+(logs, log lines, forms with detailed log information) without any
+changes to existing view definitions.
 
 **Table of contents**
 
@@ -68,6 +71,8 @@ This module requires:
 - A ClickHouse user with at least:
 
   - ``INSERT`` and ``CREATE TABLE`` privileges on the target database.
+
+- The ``pg_clickhouse`` extension installed on the PostgreSQL server.
 
 ..
 
@@ -119,6 +124,14 @@ Once auditlog_clickhouse is installed and configured:
   ClickHouse, and cleans the local buffer.
 - Data is permanently stored in ClickHouse and cannot be modified or
   deleted via Odoo.
+
+All standard Odoo audit log views work as expected - logs, log lines,
+and forms with detailed log data display data from ClickHouse. Search,
+filtering, and grouping (by user, model, date, session, query) work
+through FDW with the query being forwarded to ClickHouse. The “View
+logs” quick access button in audited model forms works as expected.
+Audit logs are read-only. Attempting to modify or delete a log entry
+from the user interface raises an error.
 
 Bug Tracker
 ===========

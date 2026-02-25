@@ -5,6 +5,7 @@ This module requires:
 - A ClickHouse database created in advance (the module does **not** create databases/users/grants).
 - A ClickHouse user with at least:
   - `INSERT` and `CREATE TABLE` privileges on the target database.
+- The `pg_clickhouse` extension installed on the PostgreSQL server.
 
 > ClickHouse installation (Docker guide):
 > `https://clickhouse.com/docs/install/docker`

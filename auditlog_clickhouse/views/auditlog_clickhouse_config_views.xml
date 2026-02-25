@@ -32,6 +32,12 @@
                         string="Create Auditlog Tables"
                         class="btn-secondary"
                     />
+                    <button
+                        name="action_setup_fdw_read"
+                        type="object"
+                        string="Setup FDW read"
+                        class="btn-secondary"
+                    />
                 </header>
 
                 <sheet>

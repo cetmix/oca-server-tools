@@ -1,6 +1,5 @@
 import logging
 import time
-import uuid
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -85,6 +84,15 @@ def _json_sanitize(obj: Any) -> Any:
 
 class AuditlogRule(models.Model):
     _inherit = "auditlog.rule"
+
+    def _next_ids(self, seq_name: str, count: int) -> list[int]:
+        if count <= 0:
+            return []
+        self.env.cr.execute(
+            "SELECT nextval(%s::regclass) FROM generate_series(1, %s)",
+            (seq_name, count),
+        )
+        return [row[0] for row in self.env.cr.fetchall()]
 
     def _get_rule_settings(self, model_id: int) -> tuple[set[str], bool]:
         """Return (fields_to_exclude_set, capture_record) for the given model_id.
@@ -185,30 +193,39 @@ class AuditlogRule(models.Model):
         now_iso = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
         model_rec = self.env["ir.model"].sudo().browse(model_id)
 
+        # IMPORTANT: do it like auditlog does (not from additional_log_values)
+        http_request_id = (
+            self.env["auditlog.http.request"].current_http_request() or None
+        )
+        http_session_id = (
+            self.env["auditlog.http.session"].current_http_session() or None
+        )
+
         base_log: dict[str, Any] = {
             "model_id": int(model_id),
             "model_name": model_rec.name,
             "model_model": model_rec.model,
             "user_id": int(uid),
             "method": method,
-            "http_request_id": additional_log_values.get("http_request_id"),
-            "http_session_id": additional_log_values.get("http_session_id"),
+            "http_request_id": http_request_id,
+            "http_session_id": http_session_id,
             "log_type": log_type,
             "create_date": now_iso,
             "create_uid": int(uid),
+            "write_date": None,
+            "write_uid": None,
         }
 
         buffer_model = (
             self.env["auditlog.log.buffer"].sudo().with_context(tracking_disable=True)
         )
 
-        buffer_vals_list: list[dict[str, Any]] = []
-
         # export_data is special (no lines)
         if method == "export_data":
+            log_id = int(self._next_ids("auditlog_log_id_seq", 1)[0])
             payload: _Payload = {
                 "log": {
-                    "id": str(uuid.uuid4()),
+                    "id": log_id,
                     "name": res_model,
                     "res_id": None,
                     "res_ids": str(list(res_ids)),
@@ -216,8 +233,7 @@ class AuditlogRule(models.Model):
                 },
                 "lines": [],
             }
-            buffer_vals_list.append({"payload_json": self._dump_payload_json(payload)})
-            buffer_model.create(buffer_vals_list)
+            buffer_model.create([{"payload_json": self._dump_payload_json(payload)}])
             _logger.debug(
                 "auditlog_clickhouse: create_logs end export_data (elapsed=%.3fs)",
                 time.monotonic() - started,
@@ -242,8 +258,12 @@ class AuditlogRule(models.Model):
             line_builder = None
             values_src = ()
 
-        for res_id in res_ids:
-            log_id = str(uuid.uuid4())
+        log_ids = self._next_ids("auditlog_log_id_seq", len(res_ids))
+        payloads: list[tuple[_PayloadLog, list[_PayloadLine]]] = []
+        total_lines = 0
+
+        for idx, res_id in enumerate(res_ids):
+            log_id = int(log_ids[idx])
             record = model_rs.browse(res_id)
 
             log: _PayloadLog = {
@@ -289,7 +309,7 @@ class AuditlogRule(models.Model):
 
                     lines.append(
                         {
-                            "id": str(uuid.uuid4()),
+                            "id": 0,
                             "log_id": log_id,
                             "field_id": int(field["id"]),
                             "field_name": field.get("name"),
@@ -300,8 +320,23 @@ class AuditlogRule(models.Model):
                             "new_value_text": vals.get("new_value_text"),
                             "create_date": now_iso,
                             "create_uid": int(uid),
+                            "write_date": None,
+                            "write_uid": None,
                         }
                     )
+
+            payloads.append((log, lines))
+            total_lines += len(lines)
+
+        # Assign line ids in one batch (Int64)
+        line_ids: list[int] = self._next_ids("auditlog_log_line_id_seq", total_lines)
+        pos = 0
+
+        buffer_vals_list: list[dict[str, Any]] = []
+        for log, lines in payloads:
+            for line in lines:
+                line["id"] = int(line_ids[pos])
+                pos += 1
 
             if method == "unlink" or lines:
                 buffer_vals_list.append(
@@ -314,3 +349,14 @@ class AuditlogRule(models.Model):
 
         if buffer_vals_list:
             buffer_model.create(buffer_vals_list)
+
+        _logger.debug(
+            "auditlog_clickhouse: create_logs end (model=%s method=%s res_ids=%s "
+            "payloads=%s lines=%s elapsed=%.3fs)",
+            res_model,
+            method,
+            len(res_ids),
+            len(buffer_vals_list),
+            total_lines,
+            time.monotonic() - started,
+        )

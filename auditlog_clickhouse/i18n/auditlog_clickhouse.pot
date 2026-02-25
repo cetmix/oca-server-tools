@@ -6,6 +6,8 @@ msgid ""
 msgstr ""
 "Project-Id-Version: Odoo Server 18.0\n"
 "Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-02-25 21:35+0000\n"
+"PO-Revision-Date: 2026-02-25 21:35+0000\n"
 "Last-Translator: \n"
 "Language-Team: \n"
 "MIME-Version: 1.0\n"
@@ -14,8 +16,52 @@ msgstr ""
 "Plural-Forms: \n"
 
 #. module: auditlog_clickhouse
+#. odoo-python
+#: code:addons/auditlog_clickhouse/models/auditlog_clickhouse_config.py:0
+msgid ""
+"%s\n"
+"\n"
+"If you save this configuration as active, the currently active one will be deactivated:\n"
+"- %s"
+msgstr ""
+
+#. module: auditlog_clickhouse
+#: model_terms:ir.ui.view,arch_db:auditlog_clickhouse.view_auditlog_clickhouse_config_form
+msgid ""
+"As soon as this connection to ClickHouse is activated, all log\n"
+"                        entries from that moment will be stored in the configured\n"
+"                        ClickHouse database. Only one connection can be active at a\n"
+"                        time."
+msgstr ""
+
+#. module: auditlog_clickhouse
+#. odoo-python
+#: code:addons/auditlog_clickhouse/models/auditlog_clickhouse_config.py:0
+msgid ""
+"As soon as this connection to ClickHouse is activated, all log entries from that moment will be stored in the configured ClickHouse database.\n"
+"\n"
+" Only one connection can be active at a time."
+msgstr ""
+
+#. module: auditlog_clickhouse
 #: model:ir.model.fields,field_description:auditlog_clickhouse.field_auditlog_log_buffer__attempt_count
 msgid "Attempt Count"
+msgstr ""
+
+#. module: auditlog_clickhouse
+#. odoo-python
+#: code:addons/auditlog_clickhouse/models/auditlog_readonly.py:0
+msgid "Audit logs are read-only (stored in ClickHouse)."
+msgstr ""
+
+#. module: auditlog_clickhouse
+#: model:ir.model,name:auditlog_clickhouse.model_auditlog_log
+msgid "Auditlog - Log"
+msgstr ""
+
+#. module: auditlog_clickhouse
+#: model:ir.model,name:auditlog_clickhouse.model_auditlog_log_line
+msgid "Auditlog - Log details (fields updated)"
 msgstr ""
 
 #. module: auditlog_clickhouse
@@ -35,8 +81,8 @@ msgid "Auditlog ClickHouse Configuration"
 msgstr ""
 
 #. module: auditlog_clickhouse
-#: model:ir.actions.server,name:auditlog_clickhouse.ir_cron_auditlog_clickhouse_flush_ir_actions_server
-msgid "Auditlog ClickHouse: flush buffer"
+#: model:ir.actions.server,name:auditlog_clickhouse.ir_cron_auditlog_clickhouse_enqueue_flush_ir_actions_server
+msgid "Auditlog ClickHouse: enqueue buffer flush"
 msgstr ""
 
 #. module: auditlog_clickhouse
@@ -46,9 +92,25 @@ msgid "Auditlog tables were created (if they did not exist)."
 msgstr ""
 
 #. module: auditlog_clickhouse
+#: model:ir.model.fields,field_description:auditlog_clickhouse.field_auditlog_clickhouse_config__queue_batch_size
+msgid "Batch size"
+msgstr ""
+
+#. module: auditlog_clickhouse
+#: model:ir.model.fields,field_description:auditlog_clickhouse.field_auditlog_clickhouse_config__queue_channel_id
+msgid "Channel"
+msgstr ""
+
+#. module: auditlog_clickhouse
 #: model:ir.actions.act_window,name:auditlog_clickhouse.action_auditlog_clickhouse_config
 #: model_terms:ir.ui.view,arch_db:auditlog_clickhouse.view_auditlog_clickhouse_config_list
 msgid "ClickHouse Configuration"
+msgstr ""
+
+#. module: auditlog_clickhouse
+#. odoo-python
+#: code:addons/auditlog_clickhouse/models/auditlog_clickhouse_config.py:0
+msgid "ClickHouse activation"
 msgstr ""
 
 #. module: auditlog_clickhouse
@@ -60,12 +122,6 @@ msgstr ""
 #. odoo-python
 #: code:addons/auditlog_clickhouse/models/auditlog_clickhouse_config.py:0
 msgid "ClickHouse connection failed: %s"
-msgstr ""
-
-#. module: auditlog_clickhouse
-#. odoo-python
-#: code:addons/auditlog_clickhouse/models/auditlog_log_buffer.py:0
-msgid "ClickHouse insert failed: %s"
 msgstr ""
 
 #. module: auditlog_clickhouse
@@ -86,6 +142,16 @@ msgstr ""
 msgid ""
 "ClickHouse user name used for INSERT operations into auditlog tables. "
 "Recommended: a dedicated user with INSERT-only privileges."
+msgstr ""
+
+#. module: auditlog_clickhouse
+#: model_terms:ir.ui.view,arch_db:auditlog_clickhouse.view_auditlog_clickhouse_config_form
+msgid "Configure action"
+msgstr ""
+
+#. module: auditlog_clickhouse
+#: model:ir.actions.act_window,name:auditlog_clickhouse.action_configure_auditlog_clickhouse_flush_cron
+msgid "Configure flush action"
 msgstr ""
 
 #. module: auditlog_clickhouse
@@ -128,6 +194,11 @@ msgid "Display Name"
 msgstr ""
 
 #. module: auditlog_clickhouse
+#: model:ir.actions.act_window,name:auditlog_clickhouse.action_configure_auditlog_clickhouse_cron
+msgid "Edit buffer flush schedule"
+msgstr ""
+
+#. module: auditlog_clickhouse
 #. odoo-python
 #: code:addons/auditlog_clickhouse/models/auditlog_log_buffer.py:0
 msgid "Error"
@@ -139,9 +210,49 @@ msgid "Error Message"
 msgstr ""
 
 #. module: auditlog_clickhouse
+#: model_terms:ir.ui.view,arch_db:auditlog_clickhouse.view_auditlog_clickhouse_config_form
+msgid "Export Queue"
+msgstr ""
+
+#. module: auditlog_clickhouse
+#: model:ir.model.fields,field_description:auditlog_clickhouse.field_auditlog_clickhouse_config__fdw_enabled
+msgid "FDW enabled"
+msgstr ""
+
+#. module: auditlog_clickhouse
+#. odoo-python
+#: code:addons/auditlog_clickhouse/models/auditlog_clickhouse_config.py:0
+msgid "FDW server and user mapping were configured."
+msgstr ""
+
+#. module: auditlog_clickhouse
 #. odoo-python
 #: code:addons/auditlog_clickhouse/models/auditlog_clickhouse_config.py:0
 msgid "Failed to create ClickHouse tables: %s"
+msgstr ""
+
+#. module: auditlog_clickhouse
+#. odoo-python
+#: code:addons/auditlog_clickhouse/models/auditlog_clickhouse_config.py:0
+msgid "Failed to create/alter FDW server: %s"
+msgstr ""
+
+#. module: auditlog_clickhouse
+#. odoo-python
+#: code:addons/auditlog_clickhouse/models/auditlog_clickhouse_config.py:0
+msgid "Failed to create/alter user mapping: %s"
+msgstr ""
+
+#. module: auditlog_clickhouse
+#. odoo-python
+#: code:addons/auditlog_clickhouse/models/auditlog_log_buffer.py:0
+msgid "Flushed to ClickHouse but failed to delete buffer rows: %s"
+msgstr ""
+
+#. module: auditlog_clickhouse
+#. odoo-python
+#: code:addons/auditlog_clickhouse/models/auditlog_clickhouse_config.py:0
+msgid "Host is required."
 msgstr ""
 
 #. module: auditlog_clickhouse
@@ -157,17 +268,14 @@ msgstr ""
 
 #. module: auditlog_clickhouse
 #: model:ir.model.fields,help:auditlog_clickhouse.field_auditlog_clickhouse_config__is_active
-msgid "If unchecked, no audit logs will be flushed to ClickHouse."
-msgstr ""
-
-#. module: auditlog_clickhouse
-#. odoo-python
-#: code:addons/auditlog_clickhouse/models/auditlog_log_buffer.py:0
-msgid "Invalid JSON payload: %s"
+msgid ""
+"If checked audit logs will be buffered locally and exported to ClickHouse. "
+"Only one configuration can be active at a time."
 msgstr ""
 
 #. module: auditlog_clickhouse
 #: model:ir.model.fields,field_description:auditlog_clickhouse.field_auditlog_clickhouse_config__is_active
+#: model_terms:ir.ui.view,arch_db:auditlog_clickhouse.view_auditlog_clickhouse_config_list
 msgid "Is Active"
 msgstr ""
 
@@ -186,29 +294,18 @@ msgstr ""
 #. module: auditlog_clickhouse
 #: model_terms:ir.ui.view,arch_db:auditlog_clickhouse.view_auditlog_clickhouse_config_form
 msgid ""
-"Logs are buffered in PostgreSQL and periodically flushed to ClickHouse by "
-"cron."
+"Logs are buffered in PostgreSQL and periodically flushed to\n"
+"                            ClickHouse by cron."
+msgstr ""
+
+#. module: auditlog_clickhouse
+#: model:ir.model.fields,help:auditlog_clickhouse.field_auditlog_clickhouse_config__queue_batch_size
+msgid "Maximum number of buffer rows processed per queue job run."
 msgstr ""
 
 #. module: auditlog_clickhouse
 #: model_terms:ir.ui.view,arch_db:auditlog_clickhouse.view_auditlog_clickhouse_config_form
 msgid "Notes"
-msgstr ""
-
-#. module: auditlog_clickhouse
-#. odoo-python
-#: code:addons/auditlog_clickhouse/models/auditlog_clickhouse_config.py:0
-msgid ""
-"Only one ClickHouse connection can be active at a time\n"
-"\n"
-"If you save this configuration as active, the currently active one will be deactivated:\n"
-"- %s"
-msgstr ""
-
-#. module: auditlog_clickhouse
-#. odoo-python
-#: code:addons/auditlog_clickhouse/models/auditlog_clickhouse_config.py:0
-msgid "Only one active connection"
 msgstr ""
 
 #. module: auditlog_clickhouse
@@ -241,6 +338,11 @@ msgid ""
 msgstr ""
 
 #. module: auditlog_clickhouse
+#: model_terms:ir.ui.view,arch_db:auditlog_clickhouse.view_auditlog_clickhouse_config_form
+msgid "Setup FDW read"
+msgstr ""
+
+#. module: auditlog_clickhouse
 #: model:ir.model.fields,field_description:auditlog_clickhouse.field_auditlog_log_buffer__state
 msgid "State"
 msgstr ""
@@ -264,6 +366,11 @@ msgid ""
 msgstr ""
 
 #. module: auditlog_clickhouse
+#: model:ir.model.fields,help:auditlog_clickhouse.field_auditlog_clickhouse_config__fdw_enabled
+msgid "Technical flag set after configuring pg_clickhouse FDW objects."
+msgstr ""
+
+#. module: auditlog_clickhouse
 #: model_terms:ir.ui.view,arch_db:auditlog_clickhouse.view_auditlog_clickhouse_config_form
 msgid "Test connection"
 msgstr ""
@@ -271,4 +378,15 @@ msgstr ""
 #. module: auditlog_clickhouse
 #: model:ir.model.fields,field_description:auditlog_clickhouse.field_auditlog_clickhouse_config__user
 msgid "User"
+msgstr ""
+
+#. module: auditlog_clickhouse
+#. odoo-python
+#: code:addons/auditlog_clickhouse/models/auditlog_clickhouse_config.py:0
+msgid "pg_clickhouse extension is not available: %s"
+msgstr ""
+
+#. module: auditlog_clickhouse
+#: model:ir.model.fields,help:auditlog_clickhouse.field_auditlog_clickhouse_config__queue_channel_id
+msgid "queue_job channel used for export jobs."
 msgstr ""

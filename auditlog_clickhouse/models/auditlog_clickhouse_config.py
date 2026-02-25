@@ -3,6 +3,7 @@ from typing import Any, Optional
 
 from odoo import api, fields, models
 from odoo.exceptions import UserError
+from odoo.tools import SQL
 
 from .clickhouse_client import get_clickhouse_client
 
@@ -26,6 +27,7 @@ class AuditlogClickhouseConfig(models.Model):
     _description = "Auditlog ClickHouse Configuration"
     _rec_name = "display_name"
 
+    FDW_SERVER = "auditlog_clickhouse_srv"
     DEFAULT_PORT = 9000
     DEFAULT_DB = "odoo_audit"
     DEFAULT_USER = "odoo_audit_writer"
@@ -83,8 +85,7 @@ class AuditlogClickhouseConfig(models.Model):
 
     def _default_queue_channel(self):
         Channel = self.env["queue.job.channel"].sudo()
-        channel = Channel.search([("complete_name", "=", "root")], limit=1)
-        return channel
+        return Channel.search([("complete_name", "=", "root")], limit=1)
 
     queue_channel_id = fields.Many2one(
         comodel_name="queue.job.channel",
@@ -93,6 +94,12 @@ class AuditlogClickhouseConfig(models.Model):
         default=_default_queue_channel,
         ondelete="restrict",
         help="queue_job channel used for export jobs.",
+    )
+
+    fdw_enabled = fields.Boolean(
+        string="FDW enabled",
+        readonly=True,
+        help="Technical flag set after configuring pg_clickhouse FDW objects.",
     )
 
     @api.depends("host", "port", "database", "user", "is_active")
@@ -353,7 +360,7 @@ class AuditlogClickhouseConfig(models.Model):
             f"""
             CREATE TABLE IF NOT EXISTS {db_name}.auditlog_log
             (
-                id String,
+                id Int64,
                 name Nullable(String),
                 model_id Int32,
                 model_name Nullable(String),
@@ -366,7 +373,9 @@ class AuditlogClickhouseConfig(models.Model):
                 http_session_id Nullable(Int64),
                 log_type Nullable(String),
                 create_date DateTime64(3, 'UTC'),
-                create_uid Int32
+                create_uid Int32,
+                write_date Nullable(DateTime64(3, 'UTC')),
+                write_uid Nullable(Int32)
             )
             ENGINE = MergeTree
             ORDER BY (create_date, id)
@@ -374,8 +383,8 @@ class AuditlogClickhouseConfig(models.Model):
             f"""
             CREATE TABLE IF NOT EXISTS {db_name}.auditlog_log_line
             (
-                id String,
-                log_id String,
+                id Int64,
+                log_id Int64,
                 field_id Int32,
                 field_name Nullable(String),
                 field_description Nullable(String),
@@ -384,12 +393,340 @@ class AuditlogClickhouseConfig(models.Model):
                 old_value_text Nullable(String),
                 new_value_text Nullable(String),
                 create_date DateTime64(3, 'UTC'),
-                create_uid Int32
+                create_uid Int32,
+                write_date Nullable(DateTime64(3, 'UTC')),
+                write_uid Nullable(Int32)
             )
             ENGINE = MergeTree
             ORDER BY (create_date, id)
             """,
         ]
+
+    def _fdw_server_exists(self) -> bool:
+        self.env.cr.execute(
+            "SELECT 1 FROM pg_foreign_server WHERE srvname = %s",
+            (self.FDW_SERVER,),
+        )
+        return bool(self.env.cr.fetchone())
+
+    def _fdw_user_mapping_exists(self) -> bool:
+        # pg_user_mappings: srvname, usename (view)
+        self.env.cr.execute(
+            "SELECT 1 FROM pg_user_mappings "
+            "WHERE srvname = %s AND usename = current_user",
+            (self.FDW_SERVER,),
+        )
+        return bool(self.env.cr.fetchone())
+
+    def action_setup_fdw_read(self):
+        """UI button: configure pg_clickhouse FDW server + user mapping."""
+        self.ensure_one()
+
+        try:
+            self.env.cr.execute("CREATE EXTENSION IF NOT EXISTS pg_clickhouse")
+        except Exception as exc:
+            raise UserError(
+                self.env._("pg_clickhouse extension is not available: %s") % exc
+            ) from exc
+
+        driver = "binary"
+        host = (self.host or "").strip()
+        if not host:
+            raise UserError(self.env._("Host is required."))
+        port = int(self.port or 0) or self.DEFAULT_PORT
+        port_opt = str(port)
+        dbname = (self.database or "").strip() or self.DEFAULT_DB
+
+        try:
+            if self._fdw_server_exists():
+                self.env.cr.execute(
+                    SQL(
+                        """
+                        ALTER SERVER %s OPTIONS (
+                            SET driver %s,
+                            SET host %s,
+                            SET port %s,
+                            SET dbname %s
+                        )
+                        """,
+                        SQL.identifier(self.FDW_SERVER),
+                        driver,
+                        host,
+                        port_opt,
+                        dbname,
+                    )
+                )
+            else:
+                self.env.cr.execute(
+                    SQL(
+                        """
+                        CREATE SERVER %s
+                        FOREIGN DATA WRAPPER clickhouse_fdw
+                        OPTIONS (
+                            driver %s,
+                            host %s,
+                            port %s,
+                            dbname %s
+                        )
+                        """,
+                        SQL.identifier(self.FDW_SERVER),
+                        driver,
+                        host,
+                        port_opt,
+                        dbname,
+                    )
+                )
+        except Exception as exc:
+            raise UserError(
+                self.env._("Failed to create/alter FDW server: %s") % exc
+            ) from exc
+
+        ch_user = (self.user or "default").strip() or "default"
+        ch_pass = self.password or ""
+
+        try:
+            if self._fdw_user_mapping_exists():
+                self.env.cr.execute(
+                    SQL(
+                        """
+                        ALTER USER MAPPING FOR CURRENT_USER
+                        SERVER %s
+                        OPTIONS (
+                            SET user %s,
+                            SET password %s
+                        )
+                        """,
+                        SQL.identifier(self.FDW_SERVER),
+                        ch_user,
+                        ch_pass,
+                    )
+                )
+            else:
+                self.env.cr.execute(
+                    SQL(
+                        """
+                        CREATE USER MAPPING FOR CURRENT_USER
+                        SERVER %s
+                        OPTIONS (
+                            user %s,
+                            password %s
+                        )
+                        """,
+                        SQL.identifier(self.FDW_SERVER),
+                        ch_user,
+                        ch_pass,
+                    )
+                )
+        except Exception as exc:
+            raise UserError(
+                self.env._("Failed to create/alter user mapping: %s") % exc
+            ) from exc
+
+        self._swap_auditlog_tables_to_fdw()
+
+        self.write({"fdw_enabled": True})
+        return self._notify(
+            title=self.env._("Success"),
+            message=self.env._("FDW server and user mapping were configured."),
+            notif_type="success",
+        )
+
+    def _relation_kind(self, schema: str, name: str) -> str | None:
+        """Return pg_class.relkind for schema.name, or None if missing."""
+        self.env.cr.execute("SELECT to_regclass(%s)", (f"{schema}.{name}",))
+        reg = self.env.cr.fetchone()[0]
+        if not reg:
+            return None
+        self.env.cr.execute(
+            """
+            SELECT c.relkind
+            FROM pg_class c
+                     JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = %s
+              AND c.relname = %s
+            """,
+            (schema, name),
+        )
+        row = self.env.cr.fetchone()
+        return row[0] if row else None
+
+    def _drop_foreign_table_if_exists(self, schema: str, name: str):
+        kind = self._relation_kind(schema, name)
+        if kind == "f":
+            self.env.cr.execute(
+                SQL(
+                    "DROP FOREIGN TABLE %s.%s",
+                    SQL.identifier(schema),
+                    SQL.identifier(name),
+                )
+            )
+
+    def _rename_table_if_exists(self, schema: str, name: str, new_name: str):
+        kind = self._relation_kind(schema, name)
+        if kind == "r":  # ordinary table
+            self.env.cr.execute(
+                SQL(
+                    "ALTER TABLE %s.%s RENAME TO %s",
+                    SQL.identifier(schema),
+                    SQL.identifier(name),
+                    SQL.identifier(new_name),
+                )
+            )
+
+    def _ensure_sequences(self):
+        # needed for integer ids if PG tables are swapped away
+        self.env.cr.execute("CREATE SEQUENCE IF NOT EXISTS auditlog_log_id_seq")
+        self.env.cr.execute("CREATE SEQUENCE IF NOT EXISTS auditlog_log_line_id_seq")
+
+    def _create_foreign_tables(self, schema: str):
+        # pg_clickhouse foreign table options: table_name,
+        # (optional) database :contentReference[oaicite:1]{index=1}
+        db_opt = (self.database or "").strip()
+
+        # auditlog_log
+        self.env.cr.execute(
+            SQL(
+                """
+                CREATE FOREIGN TABLE %s.%s (
+                    id bigint,
+                    create_date timestamp,
+                    create_uid integer,
+                    write_date timestamp,
+                    write_uid integer,
+                    name text,
+                    model_id integer,
+                    model_name text,
+                    model_model text,
+                    res_id bigint,
+                    res_ids text,
+                    user_id integer,
+                    method text,
+                    http_session_id integer,
+                    http_request_id integer,
+                    log_type text
+                )
+                SERVER %s
+                OPTIONS (table_name %s, database %s)
+                """,
+                SQL.identifier(schema),
+                SQL.identifier("auditlog_log"),
+                SQL.identifier(self.FDW_SERVER),
+                "auditlog_log",
+                db_opt,
+            )
+        )
+
+        # auditlog_log_line
+        self.env.cr.execute(
+            SQL(
+                """
+                CREATE FOREIGN TABLE %s.%s (
+                    id bigint,
+                    create_date timestamp,
+                    create_uid integer,
+                    write_date timestamp,
+                    write_uid integer,
+                    field_id integer,
+                    log_id bigint,
+                    old_value text,
+                    new_value text,
+                    old_value_text text,
+                    new_value_text text,
+                    field_name text,
+                    field_description text
+                )
+                SERVER %s
+                OPTIONS (table_name %s, database %s)
+                """,
+                SQL.identifier(schema),
+                SQL.identifier("auditlog_log_line"),
+                SQL.identifier(self.FDW_SERVER),
+                "auditlog_log_line",
+                db_opt,
+            )
+        )
+
+    def _recreate_auditlog_log_line_view(self, schema: str):
+        # Odoo model auditlog.log.line.view expects this view name.
+        # Drop first to avoid old OID dependencies when swapping tables.
+        self.env.cr.execute(
+            SQL(
+                "DROP VIEW IF EXISTS %s.%s",
+                SQL.identifier(schema),
+                SQL.identifier("auditlog_log_line_view"),
+            )
+        )
+        self.env.cr.execute(
+            SQL(
+                """
+                CREATE VIEW %s.%s AS
+                SELECT alogl.id,
+                       alogl.create_date,
+                       alogl.create_uid,
+                       alogl.write_uid,
+                       alogl.write_date,
+                       alogl.field_id,
+                       alogl.log_id,
+                       alogl.old_value,
+                       alogl.new_value,
+                       alogl.old_value_text,
+                       alogl.new_value_text,
+                       alogl.field_name,
+                       alogl.field_description,
+                       alog.name,
+                       alog.model_id,
+                       alog.model_name,
+                       alog.model_model,
+                       alog.res_id,
+                       alog.user_id,
+                       alog.method,
+                       alog.http_session_id,
+                       alog.http_request_id,
+                       alog.log_type
+                FROM %s.%s alogl
+                         JOIN %s.%s alog ON alog.id = alogl.log_id
+                """,
+                SQL.identifier(schema),
+                SQL.identifier("auditlog_log_line_view"),
+                SQL.identifier(schema),
+                SQL.identifier("auditlog_log_line"),
+                SQL.identifier(schema),
+                SQL.identifier("auditlog_log"),
+            )
+        )
+
+    def _swap_auditlog_tables_to_fdw(self):
+        """Make auditlog read from ClickHouse through pg_clickhouse foreign tables."""
+        self.ensure_one()
+        schema = "public"
+
+        # 1) Drop SQL view first (it binds to old table OIDs)
+        self.env.cr.execute(
+            SQL(
+                "DROP VIEW IF EXISTS %s.%s",
+                SQL.identifier(schema),
+                SQL.identifier("auditlog_log_line_view"),
+            )
+        )
+
+        # 2) If foreign tables already exist, drop them (safe; data is in ClickHouse)
+        self._drop_foreign_table_if_exists(schema, "auditlog_log_line")
+        self._drop_foreign_table_if_exists(schema, "auditlog_log")
+
+        # 3) If ordinary tables exist, rename to backup (keep local history)
+        self._rename_table_if_exists(
+            schema, "auditlog_log_line", "auditlog_log_line_pg_backup"
+        )
+        self._rename_table_if_exists(schema, "auditlog_log", "auditlog_log_pg_backup")
+
+        # 4) Ensure sequences (needed by our ClickHouse write path)
+        self._ensure_sequences()
+
+        # 5) Create foreign tables
+        self._create_foreign_tables(schema)
+
+        # 6) Recreate view that auditlog uses for details
+        self._recreate_auditlog_log_line_view(schema)
 
     @staticmethod
     def _notify(
