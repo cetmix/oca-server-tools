@@ -5,7 +5,7 @@ from odoo.exceptions import UserError
 def _is_clickhouse_readonly_mode(env) -> bool:
     """Return True when ClickHouse mode is active and FDW read is enabled."""
     config = env["auditlog.clickhouse.config"].sudo().get_active_config()
-    return bool(config and config.is_active and getattr(config, "fdw_enabled", False))
+    return bool(config and config.fdw_enabled)
 
 
 def _raise_clickhouse_readonly(env) -> None:

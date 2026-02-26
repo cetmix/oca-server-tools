@@ -71,7 +71,7 @@
                             <button
                                 name="%(action_configure_auditlog_clickhouse_flush_cron)d"
                                 type="action"
-                                string="Configure action"
+                                string="Configure flush cron"
                                 class="oe_link"
                                 icon="fa-arrow-right"
                             />

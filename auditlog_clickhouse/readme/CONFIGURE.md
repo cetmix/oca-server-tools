@@ -30,3 +30,4 @@ Steps:
 
 - Click **Test connection**.
 - Optionally, click **Create Auditlog Tables** to create the tables in the target database.
+- Click **Setup FDW read** to configure the Foreign Data Wrapper so that standard Odoo audit log views read data directly from ClickHouse.

@@ -18,5 +18,4 @@
         "data/auditlog_clickhouse_queue.xml",
         "views/auditlog_clickhouse_config_views.xml",
     ],
-    "installable": True,
 }

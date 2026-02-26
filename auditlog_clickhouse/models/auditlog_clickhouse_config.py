@@ -102,6 +102,14 @@ class AuditlogClickhouseConfig(models.Model):
         help="Technical flag set after configuring pg_clickhouse FDW objects.",
     )
 
+    _sql_constraints = [
+        (
+            "auditlog_clickhouse_queue_batch_size_positive",
+            "CHECK(queue_batch_size > 0)",
+            "Batch size must be greater than 0.",
+        ),
+    ]
+
     @api.depends("host", "port", "database", "user", "is_active")
     def _compute_display_name(self):
         for rec in self:
@@ -579,8 +587,6 @@ class AuditlogClickhouseConfig(models.Model):
         self.env.cr.execute("CREATE SEQUENCE IF NOT EXISTS auditlog_log_line_id_seq")
 
     def _create_foreign_tables(self, schema: str):
-        # pg_clickhouse foreign table options: table_name,
-        # (optional) database :contentReference[oaicite:1]{index=1}
         db_opt = (self.database or "").strip()
 
         # auditlog_log
