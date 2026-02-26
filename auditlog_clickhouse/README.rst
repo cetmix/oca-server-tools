@@ -74,11 +74,6 @@ This module requires:
 
 - The ``pg_clickhouse`` extension installed on the PostgreSQL server.
 
-..
-
-   ClickHouse installation (Docker guide):
-   ``https://clickhouse.com/docs/install/docker``
-
 Steps:
 
 - Make sure ``clickhouse-driver`` is available in your system.
